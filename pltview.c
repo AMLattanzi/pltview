@@ -833,7 +833,8 @@ void render_slice(PlotfileData *pf) {
             XSetForeground(display, gc, pixel);
             
             int x = offset_x + (int)(i * pixel_width);
-            int y = offset_y + (int)(j * pixel_height);
+            /* Flip y-axis: higher j (higher y in data) should be at top of screen */
+            int y = offset_y + (int)((height - 1 - j) * pixel_height);
             int w = (int)((i + 1) * pixel_width) - (int)(i * pixel_width);
             int h = (int)((j + 1) * pixel_height) - (int)(j * pixel_height);
             if (w < 1) w = 1;
@@ -881,7 +882,8 @@ void canvas_motion_handler(Widget w, XtPointer client_data, XEvent *event, Boole
     }
     
     int data_x = (int)((mouse_x - render_offset_x) * slice_width / (double)render_width);
-    int data_y = (int)((mouse_y - render_offset_y) * slice_height / (double)render_height);
+    /* Flip y-axis for mouse coordinates to match flipped rendering */
+    int data_y = slice_height - 1 - (int)((mouse_y - render_offset_y) * slice_height / (double)render_height);
     
     if (data_x >= 0 && data_x < slice_width && data_y >= 0 && data_y < slice_height) {
         double value = current_slice_data[data_y * slice_width + data_x];
@@ -908,7 +910,8 @@ void canvas_button_handler(Widget w, XtPointer client_data, XEvent *event, Boole
     }
     
     int data_x = (int)((mouse_x - render_offset_x) * slice_width / (double)render_width);
-    int data_y = (int)((mouse_y - render_offset_y) * slice_height / (double)render_height);
+    /* Flip y-axis for mouse coordinates to match flipped rendering */
+    int data_y = slice_height - 1 - (int)((mouse_y - render_offset_y) * slice_height / (double)render_height);
     
     if (data_x >= 0 && data_x < slice_width && data_y >= 0 && data_y < slice_height) {
         show_line_profiles(global_pf, data_x, data_y);
