@@ -24,6 +24,8 @@
 #include <X11/Xaw/Scrollbar.h>
 #include <X11/Xaw/Label.h>
 #include <X11/Xaw/Simple.h>
+#include <X11/Xaw/Text.h>
+#include <X11/Xaw/AsciiText.h>
 
 #define MAX_VARS 128
 #define MAX_BOXES 1024
@@ -80,7 +82,7 @@ typedef struct {
 /* X11 globals */
 Display *display;
 Widget toplevel, form, canvas_widget, var_box, info_label;
-Widget axis_box, cmap_box, nav_box, colorbar_widget;
+Widget axis_box, cmap_box, nav_box, colorbar_widget, layer_input;
 Window canvas, colorbar;
 GC gc, text_gc, colorbar_gc;
 XImage *ximage;
@@ -126,6 +128,8 @@ void var_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void axis_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void level_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void nav_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void layer_input_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void update_layer_input(PlotfileData *pf);
 void canvas_expose_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void canvas_motion_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch);
 void canvas_button_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch);
@@ -736,6 +740,14 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
         XtAddCallback(button, XtNcallback, nav_button_callback, (XtPointer)(long)i);
     }
     
+    /* Layer input text field */
+    n = 0;
+    XtSetArg(args[n], XtNstring, "1"); n++;
+    XtSetArg(args[n], XtNeditType, XawtextEdit); n++;
+    XtSetArg(args[n], XtNwidth, 80); n++;
+    XtSetArg(args[n], XtNheight, 25); n++;
+    layer_input = XtCreateManagedWidget("layerInput", asciiTextWidgetClass, nav_box, args, n);
+    
     /* COLUMN 2: Level and Colormap buttons */
     /* Level buttons box (only if multiple levels exist) */
     Widget level_box = NULL;
@@ -899,6 +911,7 @@ void axis_button_callback(Widget w, XtPointer client_data, XtPointer call_data) 
         global_pf->slice_axis = axis;
         global_pf->slice_idx = 0;  /* Start at first layer */
         
+        update_layer_input(global_pf);
         update_info_label(global_pf);
         render_slice(global_pf);
     }
@@ -921,6 +934,7 @@ void level_button_callback(Widget w, XtPointer client_data, XtPointer call_data)
             global_pf->slice_idx = max_idx;
         }
         
+        update_layer_input(global_pf);
         update_info_label(global_pf);
         render_slice(global_pf);
     }
@@ -946,9 +960,44 @@ void nav_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
             }
         }
         
+        update_layer_input(global_pf);
         update_info_label(global_pf);
         render_slice(global_pf);
     }
+}
+
+/* Layer input callback - jump to specified layer */
+void layer_input_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    if (global_pf) {
+        char *text;
+        Arg args[1];
+        XtSetArg(args[0], XtNstring, &text);
+        XtGetValues(layer_input, args, 1);
+        
+        int layer = atoi(text);
+        int max_idx = global_pf->grid_dims[global_pf->slice_axis];
+        
+        /* Convert from 1-indexed to 0-indexed and clamp */
+        layer = layer - 1;
+        if (layer < 0) layer = 0;
+        if (layer >= max_idx) layer = max_idx - 1;
+        
+        global_pf->slice_idx = layer;
+        update_layer_input(global_pf);
+        update_info_label(global_pf);
+        render_slice(global_pf);
+    }
+}
+
+/* Update layer input text field */
+void update_layer_input(PlotfileData *pf) {
+    char text[32];
+    int max_idx = pf->grid_dims[pf->slice_axis];
+    snprintf(text, sizeof(text), "%d/%d", pf->slice_idx + 1, max_idx);
+    
+    Arg args[1];
+    XtSetArg(args[0], XtNstring, text);
+    XtSetValues(layer_input, args, 1);
 }
 
 /* Colormap button callback */
@@ -1466,6 +1515,7 @@ int main(int argc, char **argv) {
     /* Initialize GUI */
     init_gui(&pf, argc, argv);
     
+    update_layer_input(&pf);
     update_info_label(&pf);
     render_slice(&pf);
     
@@ -1515,8 +1565,18 @@ int main(int argc, char **argv) {
             }
             
             if (changed) {
+                update_layer_input(global_pf);
                 update_info_label(global_pf);
                 render_slice(global_pf);
+            }
+        }
+        /* Handle Enter key in text input */
+        else if (event.type == KeyPress) {
+            if (event.xkey.window == XtWindow(layer_input)) {
+                KeySym key = XLookupKeysym(&event.xkey, 0);
+                if (key == XK_Return || key == XK_KP_Enter) {
+                    layer_input_callback(layer_input, NULL, NULL);
+                }
             }
         }
         
