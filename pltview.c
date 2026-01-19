@@ -25,6 +25,7 @@
 #include <X11/Xaw/Label.h>
 #include <X11/Xaw/Simple.h>
 #include <X11/Xaw/Dialog.h>
+#include <X11/Xaw/AsciiText.h>
 
 #define MAX_VARS 128
 #define MAX_BOXES 1024
@@ -1000,6 +1001,38 @@ void jump_to_layer_callback(Widget w, XtPointer client_data, XtPointer call_data
     XtDestroyWidget(shell);
 }
 
+/* Jump to typed layer number */
+void jump_to_typed_layer_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    Widget text_widget = (Widget)client_data;
+    
+    if (global_pf) {
+        String value;
+        Arg args[1];
+        XtSetArg(args[0], XtNstring, &value);
+        XtGetValues(text_widget, args, 1);
+        
+        if (value && strlen(value) > 0) {
+            int layer = atoi(value);
+            int max_idx = global_pf->grid_dims[global_pf->slice_axis];
+            
+            /* Convert from 1-indexed to 0-indexed and clamp */
+            layer = layer - 1;
+            if (layer < 0) layer = 0;
+            if (layer >= max_idx) layer = max_idx - 1;
+            
+            global_pf->slice_idx = layer;
+            update_layer_label(global_pf);
+            update_info_label(global_pf);
+            render_slice(global_pf);
+        }
+    }
+    
+    /* Close the dialog */
+    Widget shell = XtParent(XtParent(XtParent(text_widget)));
+    XtPopdown(shell);
+    XtDestroyWidget(shell);
+}
+
 /* Close jump dialog */
 void jump_dialog_close_callback(Widget w, XtPointer client_data, XtPointer call_data) {
     Widget shell = (Widget)client_data;
@@ -1007,12 +1040,12 @@ void jump_dialog_close_callback(Widget w, XtPointer client_data, XtPointer call_
     XtDestroyWidget(shell);
 }
 
-/* Jump button callback - button-based dialog (no text input for X11 reliability) */
+/* Jump button callback - hybrid dialog with both text input and quick-jump buttons */
 void jump_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
     if (global_pf) {
         Arg args[10];
         int n;
-        Widget dialog_shell, form, label, button;
+        Widget dialog_shell, form, label, button, text_widget, text_label;
         char msg[128];
         int max_idx = global_pf->grid_dims[global_pf->slice_axis];
         
@@ -1031,7 +1064,35 @@ void jump_button_callback(Widget w, XtPointer client_data, XtPointer call_data) 
         XtSetArg(args[n], XtNborderWidth, 0); n++;
         label = XtCreateManagedWidget("label", labelWidgetClass, form, args, n);
         
-        /* Jump buttons */
+        /* Text input section */
+        n = 0;
+        XtSetArg(args[n], XtNfromVert, label); n++;
+        XtSetArg(args[n], XtNlabel, "Type layer:"); n++;
+        XtSetArg(args[n], XtNborderWidth, 0); n++;
+        text_label = XtCreateManagedWidget("textLabel", labelWidgetClass, form, args, n);
+        
+        n = 0;
+        XtSetArg(args[n], XtNfromVert, text_label); n++;
+        XtSetArg(args[n], XtNwidth, 100); n++;
+        XtSetArg(args[n], XtNeditType, XawtextEdit); n++;
+        XtSetArg(args[n], XtNstring, ""); n++;
+        text_widget = XtCreateManagedWidget("textInput", asciiTextWidgetClass, form, args, n);
+        
+        n = 0;
+        XtSetArg(args[n], XtNfromVert, text_label); n++;
+        XtSetArg(args[n], XtNfromHoriz, text_widget); n++;
+        XtSetArg(args[n], XtNlabel, "Go"); n++;
+        button = XtCreateManagedWidget("go", commandWidgetClass, form, args, n);
+        XtAddCallback(button, XtNcallback, jump_to_typed_layer_callback, (XtPointer)text_widget);
+        
+        /* Or quick jump label */
+        n = 0;
+        XtSetArg(args[n], XtNfromVert, text_widget); n++;
+        XtSetArg(args[n], XtNlabel, "Or quick jump:"); n++;
+        XtSetArg(args[n], XtNborderWidth, 0); n++;
+        label = XtCreateManagedWidget("orLabel", labelWidgetClass, form, args, n);
+        
+        /* Quick jump buttons */
         n = 0;
         XtSetArg(args[n], XtNfromVert, label); n++;
         XtSetArg(args[n], XtNlabel, "First (1)"); n++;
