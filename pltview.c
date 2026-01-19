@@ -25,7 +25,7 @@
 #include <X11/Xaw/Label.h>
 #include <X11/Xaw/Simple.h>
 
-#define MAX_VARS 64
+#define MAX_VARS 128
 #define MAX_BOXES 1024
 #define MAX_PATH 512
 #define MAX_LINE 1024

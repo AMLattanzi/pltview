@@ -13,7 +13,7 @@ A lightweight X11 viewer for AMReX plotfiles, inspired by ncview.
 - **Multiple colormap options**: viridis, jet, turbo, plasma, hot, cool, gray, magma
 - **Level handling**: Preserves slice position when switching between AMR levels
 - **Dynamic grid adaptation**: Automatically adjusts to different grid dimensions per level
-- **All variables supported**: Displays all available variables (up to 64) in the sidebar
+- **Variables supported**: Displays all available variables (up to 128) in the sidebar
 
 ## Installation
 
@@ -68,7 +68,7 @@ pltview plt00100
 
 **GUI Layout:**
 
-- **Left sidebar**: Variable selection buttons (all available variables, up to 64 supported)
+- **Left sidebar**: Variable selection buttons (all available variables, up to 128 supported)
 - **Main canvas**: Data visualization with white background and aspect ratio preservation
 - **Right colorbar**: Data range and colormap scale
 - **Bottom controls** (organized in 2 columns):
