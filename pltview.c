@@ -970,71 +970,107 @@ void nav_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
     }
 }
 
-/* Dialog OK callback for layer jump */
-void jump_dialog_ok_callback(Widget w, XtPointer client_data, XtPointer call_data) {
-    Widget dialog = (Widget)client_data;
-    Widget shell = XtParent(dialog);
+/* Jump to specific layer positions - button-based for X11 forwarding reliability */
+void jump_to_layer_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    long layer_type = (long)client_data;
     
     if (global_pf) {
-        char *value = XawDialogGetValueString(dialog);
-        int layer = atoi(value);
         int max_idx = global_pf->grid_dims[global_pf->slice_axis];
+        int new_idx = global_pf->slice_idx;
         
-        /* Convert from 1-indexed to 0-indexed and clamp */
-        layer = layer - 1;
-        if (layer < 0) layer = 0;
-        if (layer >= max_idx) layer = max_idx - 1;
+        switch (layer_type) {
+            case 0: new_idx = 0; break;                    /* First */
+            case 1: new_idx = max_idx - 1; break;          /* Last */
+            case 2: new_idx = max_idx / 2; break;          /* Middle */
+            case 3: new_idx = max_idx / 4; break;          /* 1/4 */
+            case 4: new_idx = 3 * max_idx / 4; break;      /* 3/4 */
+        }
         
-        global_pf->slice_idx = layer;
-        update_layer_label(global_pf);
-        update_info_label(global_pf);
-        render_slice(global_pf);
+        if (new_idx >= 0 && new_idx < max_idx) {
+            global_pf->slice_idx = new_idx;
+            update_layer_label(global_pf);
+            update_info_label(global_pf);
+            render_slice(global_pf);
+        }
     }
     
+    /* Close the dialog */
+    Widget shell = XtParent(XtParent(w));
     XtPopdown(shell);
     XtDestroyWidget(shell);
 }
 
-/* Dialog Cancel callback */
-void jump_dialog_cancel_callback(Widget w, XtPointer client_data, XtPointer call_data) {
-    Widget dialog = (Widget)client_data;
-    Widget shell = XtParent(dialog);
+/* Close jump dialog */
+void jump_dialog_close_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    Widget shell = (Widget)client_data;
     XtPopdown(shell);
     XtDestroyWidget(shell);
 }
 
-/* Jump button callback - open dialog to jump to layer */
+/* Jump button callback - button-based dialog (no text input for X11 reliability) */
 void jump_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
     if (global_pf) {
         Arg args[10];
         int n;
-        Widget dialog, dialog_shell, text_widget;
-        char prompt[128];
+        Widget dialog_shell, form, label, button;
+        char msg[128];
         int max_idx = global_pf->grid_dims[global_pf->slice_axis];
         
-        snprintf(prompt, sizeof(prompt), "Jump to layer (1-%d):", max_idx);
+        snprintf(msg, sizeof(msg), "Jump to layer (1-%d)", max_idx);
         
         n = 0;
         XtSetArg(args[n], XtNtitle, "Jump to Layer"); n++;
         dialog_shell = XtCreatePopupShell("jumpDialog", transientShellWidgetClass, toplevel, args, n);
         
         n = 0;
-        XtSetArg(args[n], XtNlabel, prompt); n++;
-        XtSetArg(args[n], XtNvalue, ""); n++;
-        dialog = XtCreateManagedWidget("dialog", dialogWidgetClass, dialog_shell, args, n);
+        form = XtCreateManagedWidget("form", formWidgetClass, dialog_shell, args, n);
         
-        XawDialogAddButton(dialog, "OK", jump_dialog_ok_callback, (XtPointer)dialog);
-        XawDialogAddButton(dialog, "Cancel", jump_dialog_cancel_callback, (XtPointer)dialog);
+        /* Title label */
+        n = 0;
+        XtSetArg(args[n], XtNlabel, msg); n++;
+        XtSetArg(args[n], XtNborderWidth, 0); n++;
+        label = XtCreateManagedWidget("label", labelWidgetClass, form, args, n);
+        
+        /* Jump buttons */
+        n = 0;
+        XtSetArg(args[n], XtNfromVert, label); n++;
+        XtSetArg(args[n], XtNlabel, "First (1)"); n++;
+        button = XtCreateManagedWidget("first", commandWidgetClass, form, args, n);
+        XtAddCallback(button, XtNcallback, jump_to_layer_callback, (XtPointer)0);
+        
+        n = 0;
+        XtSetArg(args[n], XtNfromVert, button); n++;
+        XtSetArg(args[n], XtNlabel, "1/4"); n++;
+        button = XtCreateManagedWidget("quarter", commandWidgetClass, form, args, n);
+        XtAddCallback(button, XtNcallback, jump_to_layer_callback, (XtPointer)3);
+        
+        n = 0;
+        XtSetArg(args[n], XtNfromVert, button); n++;
+        XtSetArg(args[n], XtNlabel, "Middle"); n++;
+        button = XtCreateManagedWidget("middle", commandWidgetClass, form, args, n);
+        XtAddCallback(button, XtNcallback, jump_to_layer_callback, (XtPointer)2);
+        
+        n = 0;
+        XtSetArg(args[n], XtNfromVert, button); n++;
+        XtSetArg(args[n], XtNlabel, "3/4"); n++;
+        button = XtCreateManagedWidget("threequarter", commandWidgetClass, form, args, n);
+        XtAddCallback(button, XtNcallback, jump_to_layer_callback, (XtPointer)4);
+        
+        n = 0;
+        XtSetArg(args[n], XtNfromVert, button); n++;
+        snprintf(msg, sizeof(msg), "Last (%d)", max_idx);
+        XtSetArg(args[n], XtNlabel, msg); n++;
+        button = XtCreateManagedWidget("last", commandWidgetClass, form, args, n);
+        XtAddCallback(button, XtNcallback, jump_to_layer_callback, (XtPointer)1);
+        
+        n = 0;
+        XtSetArg(args[n], XtNfromVert, button); n++;
+        XtSetArg(args[n], XtNlabel, "Close"); n++;
+        button = XtCreateManagedWidget("close", commandWidgetClass, form, args, n);
+        XtAddCallback(button, XtNcallback, jump_dialog_close_callback, (XtPointer)dialog_shell);
         
         XtRealizeWidget(dialog_shell);
-        
-        XtPopup(dialog_shell, XtGrabExclusive);
-        
-        /* Set keyboard focus using Xt methods only (safer for X11 forwarding) */
-        text_widget = XtNameToWidget(dialog, "value");
-        if (text_widget) {
-            XtSetKeyboardFocus(dialog_shell, text_widget);
-        }
+        XtPopup(dialog_shell, XtGrabNone);
     }
 }
 
