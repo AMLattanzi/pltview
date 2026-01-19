@@ -61,7 +61,7 @@ typedef struct {
 /* X11 globals */
 Display *display;
 Widget toplevel, form, canvas_widget, var_box, info_label, slice_scroll;
-Widget axis_box, cmap_box, colorbar_widget;
+Widget axis_box, cmap_box, nav_box, colorbar_widget;
 Window canvas, colorbar;
 GC gc, text_gc, colorbar_gc;
 XImage *ximage;
@@ -93,7 +93,9 @@ void render_slice(PlotfileData *pf);
 void update_info_label(PlotfileData *pf);
 void var_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void axis_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void nav_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void scroll_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void jump_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void canvas_expose_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void cleanup(PlotfileData *pf);
 
@@ -435,36 +437,34 @@ void apply_colormap(double *data, int width, int height,
 
 /* Draw colorbar */
 void draw_colorbar(double vmin, double vmax, int cmap_type) {
-    int i, height = 256, width = 30;
-    unsigned long *cbar_pixels = malloc(width * height * sizeof(unsigned long));
+    int height = 256, width = 30;
     
-    for (i = 0; i < height; i++) {
+    /* Clear colorbar with white background */
+    XSetForeground(display, colorbar_gc, WhitePixel(display, screen));
+    XFillRectangle(display, colorbar, colorbar_gc, 0, 0, 100, canvas_height);
+    
+    /* Draw colorbar as solid rectangles */
+    for (int i = 0; i < height; i++) {
         double t = (double)(height - 1 - i) / (height - 1);
         RGB color = get_colormap_rgb(t, cmap_type);
         unsigned long pixel = (color.r << 16) | (color.g << 8) | color.b;
-        for (int j = 0; j < width; j++) {
-            cbar_pixels[i * width + j] = pixel;
-        }
+        
+        XSetForeground(display, colorbar_gc, pixel);
+        int y = (i * canvas_height) / height;
+        int h = ((i + 1) * canvas_height) / height - y;
+        if (h < 1) h = 1;
+        XFillRectangle(display, colorbar, colorbar_gc, 0, y, width, h);
     }
-    
-    Visual *visual = DefaultVisual(display, screen);
-    XImage *cbar_image = XCreateImage(display, visual, 24, ZPixmap, 0,
-                                     (char *)cbar_pixels, width, height, 32, 0);
-    XPutImage(display, colorbar_pixmap, colorbar_gc, cbar_image, 0, 0, 0, 0, width, height);
-    XCopyArea(display, colorbar_pixmap, colorbar, colorbar_gc, 0, 0, width, height, 0, 0);
     
     /* Draw labels */
     char text[32];
-    XSetForeground(display, text_gc, WhitePixel(display, screen));
+    XSetForeground(display, text_gc, BlackPixel(display, screen));
     snprintf(text, sizeof(text), "%.2e", vmax);
     XDrawString(display, colorbar, text_gc, width + 5, 15, text, strlen(text));
     snprintf(text, sizeof(text), "%.2e", vmin);
-    XDrawString(display, colorbar, text_gc, width + 5, height - 5, text, strlen(text));
+    XDrawString(display, colorbar, text_gc, width + 5, canvas_height - 5, text, strlen(text));
     
     XFlush(display);
-    cbar_image->data = NULL;
-    XDestroyImage(cbar_image);
-    free(cbar_pixels);
 }
 
 /* Initialize GUI with Athena Widgets */
@@ -552,23 +552,7 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
         XtAddCallback(button, XtNcallback, axis_button_callback, (XtPointer)(long)i);
     }
     
-    /* Colormap buttons */
-    n = 0;
-    XtSetArg(args[n], XtNfromVert, axis_box); n++;
-    XtSetArg(args[n], XtNfromHoriz, var_box); n++;
-    XtSetArg(args[n], XtNborderWidth, 1); n++;
-    XtSetArg(args[n], XtNorientation, XtorientHorizontal); n++;
-    XtSetArg(args[n], XtNbottom, XawChainBottom); n++;
-    XtSetArg(args[n], XtNleft, XawChainLeft); n++;
-    cmap_box = XtCreateManagedWidget("cmapBox", boxWidgetClass, form, args, n);
-    
-    const char *cmap_labels[] = {"viridis", "jet", "turbo", "plasma"};
-    for (i = 0; i < 4; i++) {
-        n = 0;
-        XtSetArg(args[n], XtNlabel, cmap_labels[i]); n++;
-        button = XtCreateManagedWidget(cmap_labels[i], commandWidgetClass, cmap_box, args, n);
-        XtAddCallback(button, XtNcallback, cmap_button_callback, (XtPointer)(long)i);
-    }
+    /* Bottom controls removed - use keyboard only */
     
     /* Colorbar widget */
     n = 0;
@@ -584,7 +568,7 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     
     /* Slice scrollbar */
     n = 0;
-    XtSetArg(args[n], XtNfromVert, cmap_box); n++;
+    XtSetArg(args[n], XtNfromVert, nav_box); n++;
     XtSetArg(args[n], XtNfromHoriz, var_box); n++;
     XtSetArg(args[n], XtNwidth, 400); n++;
     XtSetArg(args[n], XtNheight, 20); n++;
@@ -594,7 +578,7 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     XtSetArg(args[n], XtNright, XawChainRight); n++;
     slice_scroll = XtCreateManagedWidget("sliceScroll", scrollbarWidgetClass, form, args, n);
     XtAddCallback(slice_scroll, XtNscrollProc, scroll_callback, NULL);
-    XtAddCallback(slice_scroll, XtNjumpProc, scroll_callback, NULL);
+    XtAddCallback(slice_scroll, XtNjumpProc, jump_callback, NULL);
     
     XtRealizeWidget(toplevel);
     
@@ -602,15 +586,19 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     canvas = XtWindow(canvas_widget);
     gc = XCreateGC(display, canvas, 0, NULL);
     XSetForeground(display, gc, BlackPixel(display, screen));
+    XSetFillStyle(display, gc, FillSolid);
+    XSetFunction(display, gc, GXcopy);
     
     /* Get colorbar window */
     colorbar = XtWindow(colorbar_widget);
     colorbar_gc = XCreateGC(display, colorbar, 0, NULL);
+    XSetFillStyle(display, colorbar_gc, FillSolid);
+    XSetFunction(display, colorbar_gc, GXcopy);
     
     /* Create text GC for overlay */
     text_gc = XCreateGC(display, canvas, 0, NULL);
-    XSetForeground(display, text_gc, WhitePixel(display, screen));
-    XSetBackground(display, text_gc, BlackPixel(display, screen));
+    XSetForeground(display, text_gc, BlackPixel(display, screen));
+    XSetBackground(display, text_gc, WhitePixel(display, screen));
     if (font) XSetFont(display, text_gc, font->fid);
     
     /* Allocate pixel buffer */
@@ -621,7 +609,7 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
                                    DefaultDepth(display, screen));
     
     /* Add event handlers */
-    XSelectInput(display, canvas, ExposureMask);
+    XSelectInput(display, canvas, ExposureMask | KeyPressMask);
     XSelectInput(display, colorbar, ExposureMask);
 }
 
@@ -632,7 +620,7 @@ void update_info_label(PlotfileData *pf) {
     int max_idx = pf->grid_dims[pf->slice_axis] - 1;
     
     snprintf(text, sizeof(text), 
-             "%s | Axis: %s | Slice: %d/%d | Time: %.3f",
+             "%s | Axis: %s | Layer: %d/%d | Time: %.3f",
              pf->variables[pf->current_var],
              axis_names[pf->slice_axis],
              pf->slice_idx, max_idx,
@@ -659,47 +647,64 @@ void axis_button_callback(Widget w, XtPointer client_data, XtPointer call_data) 
     int axis = (int)(long)client_data;
     if (global_pf) {
         global_pf->slice_axis = axis;
-        global_pf->slice_idx = global_pf->grid_dims[axis] / 2;
-        
-        /* Update scrollbar */
-        float max_val = (float)global_pf->grid_dims[axis];
-        float shown = 1.0 / max_val;
-        Arg args[2];
-        XtSetArg(args[0], XtNshown, shown);
-        XtSetArg(args[1], XtNtopOfThumb, (float)global_pf->slice_idx / max_val);
-        XtSetValues(slice_scroll, args, 2);
+        global_pf->slice_idx = 0;  /* Start at first layer */
         
         update_info_label(global_pf);
         render_slice(global_pf);
     }
 }
 
-/* Scrollbar callback */
+/* Navigation button callback (+/-) */
+void nav_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    int dir = (int)(long)client_data;  /* 0 = minus, 1 = plus */
+    if (global_pf) {
+        int max_idx = global_pf->grid_dims[global_pf->slice_axis] - 1;
+        
+        if (dir == 1 && global_pf->slice_idx < max_idx) {
+            global_pf->slice_idx++;
+        } else if (dir == 0 && global_pf->slice_idx > 0) {
+            global_pf->slice_idx--;
+        }
+        
+        update_info_label(global_pf);
+        render_slice(global_pf);
+    }
+}
+
+/* Scrollbar scroll callback (for dragging) */
 void scroll_callback(Widget w, XtPointer client_data, XtPointer call_data) {
-    if (!global_pf || !call_data) return;
+    if (!global_pf) return;
     
-    float percent;
+    int pixels = (int)(long)call_data;
     int max_idx = global_pf->grid_dims[global_pf->slice_axis] - 1;
     
-    /* Handle both scroll and jump callbacks */
-    if (sizeof(call_data) == sizeof(float*)) {
-        percent = *(float *)call_data;
-    } else {
-        /* For scroll callback, interpret as pixels */
-        int pixels = (int)(long)call_data;
-        percent = (float)global_pf->slice_idx / max_idx;
-        if (pixels > 0) percent += 1.0 / max_idx;
-        else if (pixels < 0) percent -= 1.0 / max_idx;
+    /* Increment or decrement based on scroll direction */
+    if (pixels > 0 && global_pf->slice_idx < max_idx) {
+        global_pf->slice_idx++;
+    } else if (pixels < 0 && global_pf->slice_idx > 0) {
+        global_pf->slice_idx--;
     }
+    
+    /* Update scrollbar position */
+    Arg args[1];
+    float percent = (max_idx > 0) ? (float)global_pf->slice_idx / max_idx : 0.0;
+    XtSetArg(args[0], XtNtopOfThumb, percent);
+    XtSetValues(slice_scroll, args, 1);
+    
+    update_info_label(global_pf);
+    render_slice(global_pf);
+}
+
+/* Scrollbar jump callback (for clicking on bar) */
+void jump_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    if (!global_pf || !call_data) return;
+    
+    float percent = *(float *)call_data;
+    int max_idx = global_pf->grid_dims[global_pf->slice_axis] - 1;
     
     global_pf->slice_idx = (int)(percent * max_idx + 0.5);
     if (global_pf->slice_idx > max_idx) global_pf->slice_idx = max_idx;
     if (global_pf->slice_idx < 0) global_pf->slice_idx = 0;
-    
-    /* Update scrollbar position */
-    Arg args[1];
-    XtSetArg(args[0], XtNtopOfThumb, (float)global_pf->slice_idx / max_idx);
-    XtSetValues(slice_scroll, args, 1);
     
     update_info_label(global_pf);
     render_slice(global_pf);
@@ -763,23 +768,54 @@ void render_slice(PlotfileData *pf) {
     /* Apply colormap */
     apply_colormap(slice, width, height, pixel_data, vmin, vmax, pf->colormap);
     
-    /* Create XImage and draw to pixmap */
-    Visual *visual = DefaultVisual(display, screen);
-    ximage = XCreateImage(display, visual, 24, ZPixmap, 0,
-                         (char *)pixel_data, width, height, 32, 0);
-    
-    XPutImage(display, pixmap, gc, ximage, 0, 0, 0, 0, width, height);
-    
-    /* Fill canvas background */
-    XSetForeground(display, gc, BlackPixel(display, screen));
+    /* Clear canvas with white background */
+    XSetForeground(display, gc, WhitePixel(display, screen));
     XFillRectangle(display, canvas, gc, 0, 0, canvas_width, canvas_height);
     
-    /* Draw pixmap to canvas */
-    XCopyArea(display, pixmap, canvas, gc, 0, 0, width, height, 0, 0);
+    /* Calculate scaling to maintain aspect ratio */
+    double data_aspect = (double)width / height;
+    double canvas_aspect = (double)canvas_width / canvas_height;
+    
+    int render_width, render_height, offset_x, offset_y;
+    if (data_aspect > canvas_aspect) {
+        /* Width-limited */
+        render_width = canvas_width;
+        render_height = (int)(canvas_width / data_aspect);
+        offset_x = 0;
+        offset_y = (canvas_height - render_height) / 2;
+    } else {
+        /* Height-limited */
+        render_width = (int)(canvas_height * data_aspect);
+        render_height = canvas_height;
+        offset_x = (canvas_width - render_width) / 2;
+        offset_y = 0;
+    }
+    
+    /* Draw pixels as filled rectangles with correct aspect ratio */
+    double pixel_width = (double)render_width / width;
+    double pixel_height = (double)render_height / height;
+    
+    for (int j = 0; j < height; j++) {
+        for (int i = 0; i < width; i++) {
+            unsigned long pixel = pixel_data[j * width + i];
+            XSetForeground(display, gc, pixel);
+            
+            int x = offset_x + (int)(i * pixel_width);
+            int y = offset_y + (int)(j * pixel_height);
+            int w = (int)((i + 1) * pixel_width) - (int)(i * pixel_width);
+            int h = (int)((j + 1) * pixel_height) - (int)(j * pixel_height);
+            if (w < 1) w = 1;
+            if (h < 1) h = 1;
+            
+            XFillRectangle(display, canvas, gc, x, y, w, h);
+        }
+    }
     
     /* Draw text overlay */
     snprintf(stats_text, sizeof(stats_text), "min: %.3e  max: %.3e", vmin, vmax);
-    XDrawImageString(display, canvas, text_gc, 10, height - 10, 
+    XSetForeground(display, text_gc, BlackPixel(display, screen));
+    XSetBackground(display, text_gc, WhitePixel(display, screen));
+    XDrawImageString(display, canvas, text_gc, 10, canvas_height - 10, 
                     stats_text, strlen(stats_text));
     
     /* Draw colorbar */
@@ -792,8 +828,6 @@ void render_slice(PlotfileData *pf) {
            pf->grid_dims[pf->slice_axis]-1, vmin, vmax);
     
     free(slice);
-    ximage->data = NULL;
-    XDestroyImage(ximage);
 }
 
 void cleanup(PlotfileData *pf) {
@@ -818,7 +852,7 @@ int main(int argc, char **argv) {
     /* Load first variable */
     pf.current_var = 0;
     pf.slice_axis = 2;  /* Z */
-    pf.slice_idx = pf.grid_dims[2] / 2;
+    pf.slice_idx = 0;  /* Start at first layer */
     pf.colormap = 0;  /* viridis */
     
     read_variable_data(&pf, 0);
@@ -826,23 +860,16 @@ int main(int argc, char **argv) {
     /* Initialize GUI */
     init_gui(&pf, argc, argv);
     
-    /* Set initial scrollbar position */
-    float max_val = (float)pf.grid_dims[pf.slice_axis];
-    float shown = 1.0 / max_val;
-    XtSetArg(args[0], XtNshown, shown);
-    XtSetArg(args[1], XtNtopOfThumb, (float)pf.slice_idx / max_val);
-    XtSetValues(slice_scroll, args, 2);
-    
     update_info_label(&pf);
     render_slice(&pf);
     
     printf("\nGUI Controls:\n");
     printf("  Click variable buttons to change variable\n");
     printf("  Click X/Y/Z buttons to switch axis\n");
-    printf("  Click colormap buttons (viridis/jet/turbo/plasma)\n");
-    printf("  Drag scrollbar to navigate slices\n\n");
+    printf("  Use keyboard: +/- or arrow keys to navigate layers\n");
+    printf("  Use keyboard: 0-3 for colormaps (0=viridis, 1=jet, 2=turbo, 3=plasma)\n\n");
     
-    /* Main event loop with expose handling */
+    /* Main event loop with expose and keyboard handling */
     XtAppContext app_context = XtWidgetToApplicationContext(toplevel);
     while (1) {
         XEvent event;
@@ -854,6 +881,33 @@ int main(int argc, char **argv) {
                 render_slice(global_pf);
             } else if (event.xexpose.window == colorbar && global_pf) {
                 draw_colorbar(current_vmin, current_vmax, global_pf->colormap);
+            }
+        }
+        /* Handle keyboard events */
+        else if (event.type == KeyPress && global_pf) {
+            KeySym key = XLookupKeysym(&event.xkey, 0);
+            int max_idx = global_pf->grid_dims[global_pf->slice_axis] - 1;
+            int changed = 0;
+            
+            if (key == XK_plus || key == XK_equal || key == XK_Right) {
+                if (global_pf->slice_idx < max_idx) {
+                    global_pf->slice_idx++;
+                    changed = 1;
+                }
+            } else if (key == XK_minus || key == XK_underscore || key == XK_Left) {
+                if (global_pf->slice_idx > 0) {
+                    global_pf->slice_idx--;
+                    changed = 1;
+                }
+            } else if (key >= XK_0 && key <= XK_3) {
+                /* Switch colormap with 0-3 keys */
+                global_pf->colormap = key - XK_0;
+                changed = 1;
+            }
+            
+            if (changed) {
+                update_info_label(global_pf);
+                render_slice(global_pf);
             }
         }
         
