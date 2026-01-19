@@ -50,6 +50,7 @@ typedef struct {
     int current_var;
     int slice_axis;
     int slice_idx;
+    int colormap;  /* 0=viridis, 1=jet, 2=turbo, 3=plasma */
 } PlotfileData;
 
 /* Colormap */
@@ -60,16 +61,17 @@ typedef struct {
 /* X11 globals */
 Display *display;
 Widget toplevel, form, canvas_widget, var_box, info_label, slice_scroll;
-Widget axis_box;
-Window canvas;
-GC gc, text_gc;
+Widget axis_box, cmap_box, colorbar_widget;
+Window canvas, colorbar;
+GC gc, text_gc, colorbar_gc;
 XImage *ximage;
 int screen;
 unsigned long *pixel_data;
 int canvas_width = 800;
 int canvas_height = 600;
-Pixmap pixmap;
+Pixmap pixmap, colorbar_pixmap;
 XFontStruct *font;
+double current_vmin = 0, current_vmax = 1;
 
 /* Function prototypes */
 int read_header(PlotfileData *pf);
@@ -77,8 +79,15 @@ int read_cell_h(PlotfileData *pf);
 int read_variable_data(PlotfileData *pf, int var_idx);
 void extract_slice(PlotfileData *pf, double *slice, int axis, int idx);
 void apply_colormap(double *data, int width, int height, 
-                   unsigned long *pixels, double vmin, double vmax);
+                   unsigned long *pixels, double vmin, double vmax, int cmap_type);
 RGB viridis_colormap(double t);
+RGB jet_colormap(double t);
+RGB turbo_colormap(double t);
+RGB plasma_colormap(double t);
+RGB get_colormap_rgb(double t, int cmap_type);
+void draw_colorbar(double vmin, double vmax, int cmap_type);
+void cmap_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void colorbar_expose_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void init_gui(PlotfileData *pf, int argc, char **argv);
 void render_slice(PlotfileData *pf);
 void update_info_label(PlotfileData *pf);
@@ -309,6 +318,66 @@ void extract_slice(PlotfileData *pf, double *slice, int axis, int idx) {
     }
 }
 
+/* Jet colormap */
+RGB jet_colormap(double t) {
+    RGB color;
+    if (t < 0.0) t = 0.0;
+    if (t > 1.0) t = 1.0;
+    
+    if (t < 0.25) {
+        color.r = 0;
+        color.g = (unsigned char)(255 * (4 * t));
+        color.b = 255;
+    } else if (t < 0.5) {
+        color.r = 0;
+        color.g = 255;
+        color.b = (unsigned char)(255 * (1 - 4 * (t - 0.25)));
+    } else if (t < 0.75) {
+        color.r = (unsigned char)(255 * (4 * (t - 0.5)));
+        color.g = 255;
+        color.b = 0;
+    } else {
+        color.r = 255;
+        color.g = (unsigned char)(255 * (1 - 4 * (t - 0.75)));
+        color.b = 0;
+    }
+    return color;
+}
+
+/* Turbo colormap (approximation) */
+RGB turbo_colormap(double t) {
+    RGB color;
+    if (t < 0.0) t = 0.0;
+    if (t > 1.0) t = 1.0;
+    
+    double r = t * 0.8 + 0.2;
+    double g = sin(t * 3.14159);
+    double b = 1.0 - t * 0.9;
+    
+    color.r = (unsigned char)(255 * r);
+    color.g = (unsigned char)(255 * g);
+    color.b = (unsigned char)(255 * b);
+    return color;
+}
+
+/* Plasma colormap */
+RGB plasma_colormap(double t) {
+    RGB color;
+    if (t < 0.0) t = 0.0;
+    if (t > 1.0) t = 1.0;
+    
+    if (t < 0.5) {
+        color.r = (unsigned char)(13 + (177 - 13) * (t / 0.5));
+        color.g = (unsigned char)(8 + (42 - 8) * (t / 0.5));
+        color.b = (unsigned char)(135 + (127 - 135) * (t / 0.5));
+    } else {
+        color.r = (unsigned char)(177 + (240 - 177) * ((t - 0.5) / 0.5));
+        color.g = (unsigned char)(42 + (249 - 42) * ((t - 0.5) / 0.5));
+        color.b = (unsigned char)(127 + (33 - 127) * ((t - 0.5) / 0.5));
+    }
+    return color;
+}
+
 /* Viridis colormap */
 RGB viridis_colormap(double t) {
     RGB color;
@@ -337,9 +406,19 @@ RGB viridis_colormap(double t) {
     return color;
 }
 
+/* Get RGB for any colormap */
+RGB get_colormap_rgb(double t, int cmap_type) {
+    switch(cmap_type) {
+        case 1: return jet_colormap(t);
+        case 2: return turbo_colormap(t);
+        case 3: return plasma_colormap(t);
+        default: return viridis_colormap(t);
+    }
+}
+
 /* Apply colormap to data */
 void apply_colormap(double *data, int width, int height, 
-                   unsigned long *pixels, double vmin, double vmax) {
+                   unsigned long *pixels, double vmin, double vmax, int cmap_type) {
     int i, j;
     double range = vmax - vmin;
     if (range < 1e-10) range = 1.0;
@@ -348,10 +427,44 @@ void apply_colormap(double *data, int width, int height,
         for (i = 0; i < width; i++) {
             double val = data[j * width + i];
             double t = (val - vmin) / range;
-            RGB color = viridis_colormap(t);
+            RGB color = get_colormap_rgb(t, cmap_type);
             pixels[j * width + i] = (color.r << 16) | (color.g << 8) | color.b;
         }
     }
+}
+
+/* Draw colorbar */
+void draw_colorbar(double vmin, double vmax, int cmap_type) {
+    int i, height = 256, width = 30;
+    unsigned long *cbar_pixels = malloc(width * height * sizeof(unsigned long));
+    
+    for (i = 0; i < height; i++) {
+        double t = (double)(height - 1 - i) / (height - 1);
+        RGB color = get_colormap_rgb(t, cmap_type);
+        unsigned long pixel = (color.r << 16) | (color.g << 8) | color.b;
+        for (int j = 0; j < width; j++) {
+            cbar_pixels[i * width + j] = pixel;
+        }
+    }
+    
+    Visual *visual = DefaultVisual(display, screen);
+    XImage *cbar_image = XCreateImage(display, visual, 24, ZPixmap, 0,
+                                     (char *)cbar_pixels, width, height, 32, 0);
+    XPutImage(display, colorbar_pixmap, colorbar_gc, cbar_image, 0, 0, 0, 0, width, height);
+    XCopyArea(display, colorbar_pixmap, colorbar, colorbar_gc, 0, 0, width, height, 0, 0);
+    
+    /* Draw labels */
+    char text[32];
+    XSetForeground(display, text_gc, WhitePixel(display, screen));
+    snprintf(text, sizeof(text), "%.2e", vmax);
+    XDrawString(display, colorbar, text_gc, width + 5, 15, text, strlen(text));
+    snprintf(text, sizeof(text), "%.2e", vmin);
+    XDrawString(display, colorbar, text_gc, width + 5, height - 5, text, strlen(text));
+    
+    XFlush(display);
+    cbar_image->data = NULL;
+    XDestroyImage(cbar_image);
+    free(cbar_pixels);
 }
 
 /* Initialize GUI with Athena Widgets */
@@ -439,10 +552,40 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
         XtAddCallback(button, XtNcallback, axis_button_callback, (XtPointer)(long)i);
     }
     
+    /* Colormap buttons */
+    n = 0;
+    XtSetArg(args[n], XtNfromVert, axis_box); n++;
+    XtSetArg(args[n], XtNfromHoriz, var_box); n++;
+    XtSetArg(args[n], XtNborderWidth, 1); n++;
+    XtSetArg(args[n], XtNorientation, XtorientHorizontal); n++;
+    XtSetArg(args[n], XtNbottom, XawChainBottom); n++;
+    XtSetArg(args[n], XtNleft, XawChainLeft); n++;
+    cmap_box = XtCreateManagedWidget("cmapBox", boxWidgetClass, form, args, n);
+    
+    const char *cmap_labels[] = {"viridis", "jet", "turbo", "plasma"};
+    for (i = 0; i < 4; i++) {
+        n = 0;
+        XtSetArg(args[n], XtNlabel, cmap_labels[i]); n++;
+        button = XtCreateManagedWidget(cmap_labels[i], commandWidgetClass, cmap_box, args, n);
+        XtAddCallback(button, XtNcallback, cmap_button_callback, (XtPointer)(long)i);
+    }
+    
+    /* Colorbar widget */
+    n = 0;
+    XtSetArg(args[n], XtNfromVert, info_label); n++;
+    XtSetArg(args[n], XtNfromHoriz, canvas_widget); n++;
+    XtSetArg(args[n], XtNwidth, 100); n++;
+    XtSetArg(args[n], XtNheight, canvas_height); n++;
+    XtSetArg(args[n], XtNborderWidth, 2); n++;
+    XtSetArg(args[n], XtNtop, XawChainTop); n++;
+    XtSetArg(args[n], XtNbottom, XawChainBottom); n++;
+    XtSetArg(args[n], XtNright, XawChainRight); n++;
+    colorbar_widget = XtCreateManagedWidget("colorbar", simpleWidgetClass, form, args, n);
+    
     /* Slice scrollbar */
     n = 0;
-    XtSetArg(args[n], XtNfromVert, canvas_widget); n++;
-    XtSetArg(args[n], XtNfromHoriz, axis_box); n++;
+    XtSetArg(args[n], XtNfromVert, cmap_box); n++;
+    XtSetArg(args[n], XtNfromHoriz, var_box); n++;
     XtSetArg(args[n], XtNwidth, 400); n++;
     XtSetArg(args[n], XtNheight, 20); n++;
     XtSetArg(args[n], XtNorientation, XtorientHorizontal); n++;
@@ -458,6 +601,11 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     /* Get canvas window and create GC */
     canvas = XtWindow(canvas_widget);
     gc = XCreateGC(display, canvas, 0, NULL);
+    XSetForeground(display, gc, BlackPixel(display, screen));
+    
+    /* Get colorbar window */
+    colorbar = XtWindow(colorbar_widget);
+    colorbar_gc = XCreateGC(display, colorbar, 0, NULL);
     
     /* Create text GC for overlay */
     text_gc = XCreateGC(display, canvas, 0, NULL);
@@ -469,6 +617,12 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     pixel_data = (unsigned long *)malloc(canvas_width * canvas_height * sizeof(unsigned long));
     pixmap = XCreatePixmap(display, canvas, canvas_width, canvas_height, 
                           DefaultDepth(display, screen));
+    colorbar_pixmap = XCreatePixmap(display, colorbar, 100, 256,
+                                   DefaultDepth(display, screen));
+    
+    /* Add event handlers */
+    XSelectInput(display, canvas, ExposureMask);
+    XSelectInput(display, colorbar, ExposureMask);
 }
 
 /* Update info label */
@@ -522,15 +676,42 @@ void axis_button_callback(Widget w, XtPointer client_data, XtPointer call_data) 
 
 /* Scrollbar callback */
 void scroll_callback(Widget w, XtPointer client_data, XtPointer call_data) {
-    float percent = *(float *)call_data;
+    if (!global_pf || !call_data) return;
+    
+    float percent;
+    int max_idx = global_pf->grid_dims[global_pf->slice_axis] - 1;
+    
+    /* Handle both scroll and jump callbacks */
+    if (sizeof(call_data) == sizeof(float*)) {
+        percent = *(float *)call_data;
+    } else {
+        /* For scroll callback, interpret as pixels */
+        int pixels = (int)(long)call_data;
+        percent = (float)global_pf->slice_idx / max_idx;
+        if (pixels > 0) percent += 1.0 / max_idx;
+        else if (pixels < 0) percent -= 1.0 / max_idx;
+    }
+    
+    global_pf->slice_idx = (int)(percent * max_idx + 0.5);
+    if (global_pf->slice_idx > max_idx) global_pf->slice_idx = max_idx;
+    if (global_pf->slice_idx < 0) global_pf->slice_idx = 0;
+    
+    /* Update scrollbar position */
+    Arg args[1];
+    XtSetArg(args[0], XtNtopOfThumb, (float)global_pf->slice_idx / max_idx);
+    XtSetValues(slice_scroll, args, 1);
+    
+    update_info_label(global_pf);
+    render_slice(global_pf);
+}
+
+/* Colormap button callback */
+void cmap_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    int cmap = (int)(long)client_data;
     if (global_pf) {
-        int max_idx = global_pf->grid_dims[global_pf->slice_axis] - 1;
-        global_pf->slice_idx = (int)(percent * max_idx);
-        if (global_pf->slice_idx > max_idx) global_pf->slice_idx = max_idx;
-        if (global_pf->slice_idx < 0) global_pf->slice_idx = 0;
-        
-        update_info_label(global_pf);
+        global_pf->colormap = cmap;
         render_slice(global_pf);
+        draw_colorbar(current_vmin, current_vmax, cmap);
     }
 }
 
@@ -538,6 +719,13 @@ void scroll_callback(Widget w, XtPointer client_data, XtPointer call_data) {
 void canvas_expose_callback(Widget w, XtPointer client_data, XtPointer call_data) {
     if (global_pf && global_pf->data) {
         render_slice(global_pf);
+    }
+}
+
+/* Colorbar expose callback */
+void colorbar_expose_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    if (global_pf) {
+        draw_colorbar(current_vmin, current_vmax, global_pf->colormap);
     }
 }
 void render_slice(PlotfileData *pf) {
@@ -568,8 +756,12 @@ void render_slice(PlotfileData *pf) {
         if (slice[i] > vmax) vmax = slice[i];
     }
     
+    /* Store current vmin/vmax for colorbar */
+    current_vmin = vmin;
+    current_vmax = vmax;
+    
     /* Apply colormap */
-    apply_colormap(slice, width, height, pixel_data, vmin, vmax);
+    apply_colormap(slice, width, height, pixel_data, vmin, vmax, pf->colormap);
     
     /* Create XImage and draw to pixmap */
     Visual *visual = DefaultVisual(display, screen);
@@ -578,6 +770,10 @@ void render_slice(PlotfileData *pf) {
     
     XPutImage(display, pixmap, gc, ximage, 0, 0, 0, 0, width, height);
     
+    /* Fill canvas background */
+    XSetForeground(display, gc, BlackPixel(display, screen));
+    XFillRectangle(display, canvas, gc, 0, 0, canvas_width, canvas_height);
+    
     /* Draw pixmap to canvas */
     XCopyArea(display, pixmap, canvas, gc, 0, 0, width, height, 0, 0);
     
@@ -585,6 +781,9 @@ void render_slice(PlotfileData *pf) {
     snprintf(stats_text, sizeof(stats_text), "min: %.3e  max: %.3e", vmin, vmax);
     XDrawImageString(display, canvas, text_gc, 10, height - 10, 
                     stats_text, strlen(stats_text));
+    
+    /* Draw colorbar */
+    draw_colorbar(vmin, vmax, pf->colormap);
     
     XFlush(display);
     
@@ -620,6 +819,7 @@ int main(int argc, char **argv) {
     pf.current_var = 0;
     pf.slice_axis = 2;  /* Z */
     pf.slice_idx = pf.grid_dims[2] / 2;
+    pf.colormap = 0;  /* viridis */
     
     read_variable_data(&pf, 0);
     
@@ -639,9 +839,26 @@ int main(int argc, char **argv) {
     printf("\nGUI Controls:\n");
     printf("  Click variable buttons to change variable\n");
     printf("  Click X/Y/Z buttons to switch axis\n");
+    printf("  Click colormap buttons (viridis/jet/turbo/plasma)\n");
     printf("  Drag scrollbar to navigate slices\n\n");
     
-    XtAppMainLoop(XtWidgetToApplicationContext(toplevel));
+    /* Main event loop with expose handling */
+    XtAppContext app_context = XtWidgetToApplicationContext(toplevel);
+    while (1) {
+        XEvent event;
+        XtAppNextEvent(app_context, &event);
+        
+        /* Handle expose events */
+        if (event.type == Expose) {
+            if (event.xexpose.window == canvas && global_pf && global_pf->data) {
+                render_slice(global_pf);
+            } else if (event.xexpose.window == colorbar && global_pf) {
+                draw_colorbar(current_vmin, current_vmax, global_pf->colormap);
+            }
+        }
+        
+        XtDispatchEvent(&event);
+    }
     
     cleanup(&pf);
     return 0;

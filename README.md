@@ -107,12 +107,16 @@ python -m pltview plt00100
 - **Mouse Click**: Click on any point to open line plots along X, Y, Z directions
 - **Matplotlib Toolbar**: Use built-in tools to zoom, pan, and save images
 
-### C Version (Keyboard)
+### C Version (GUI)
 
-- **Arrow keys / +/-**: Navigate through slices
-- **x/y/z**: Switch viewing axis
-- **0-9**: Select variable (0 = first variable, 1 = second, etc.)
-- **q/Esc**: Quit
+- **Variable Buttons** (left sidebar): Click to select which variable to visualize
+- **Axis Buttons** (X/Y/Z, bottom): Click to switch viewing axis
+- **Colormap Buttons** (viridis/jet/turbo/plasma, bottom): Select colormap
+- **Scrollbar** (bottom): Drag to navigate through slices
+- **Colorbar** (right): Shows data range and colormap scale
+- **Text Overlay**: Displays min/max values on the image
+
+The viewer automatically renders the selected slice with the chosen colormap and displays statistics.
 
 ## Performance Comparison
 
