@@ -24,8 +24,7 @@
 #include <X11/Xaw/Scrollbar.h>
 #include <X11/Xaw/Label.h>
 #include <X11/Xaw/Simple.h>
-#include <X11/Xaw/Text.h>
-#include <X11/Xaw/AsciiText.h>
+#include <X11/Xaw/Dialog.h>
 
 #define MAX_VARS 128
 #define MAX_BOXES 1024
@@ -82,7 +81,7 @@ typedef struct {
 /* X11 globals */
 Display *display;
 Widget toplevel, form, canvas_widget, var_box, info_label;
-Widget axis_box, cmap_box, nav_box, colorbar_widget, layer_input;
+Widget axis_box, cmap_box, nav_box, colorbar_widget, layer_label;
 Window canvas, colorbar;
 GC gc, text_gc, colorbar_gc;
 XImage *ximage;
@@ -128,8 +127,8 @@ void var_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void axis_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void level_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void nav_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
-void layer_input_callback(Widget w, XtPointer client_data, XtPointer call_data);
-void update_layer_input(PlotfileData *pf);
+void jump_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void update_layer_label(PlotfileData *pf);
 void canvas_expose_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void canvas_motion_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch);
 void canvas_button_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch);
@@ -740,13 +739,18 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
         XtAddCallback(button, XtNcallback, nav_button_callback, (XtPointer)(long)i);
     }
     
-    /* Layer input text field */
+    /* Layer display label */
     n = 0;
-    XtSetArg(args[n], XtNstring, "1"); n++;
-    XtSetArg(args[n], XtNeditType, XawtextEdit); n++;
+    XtSetArg(args[n], XtNlabel, "1/1"); n++;
     XtSetArg(args[n], XtNwidth, 60); n++;
-    XtSetArg(args[n], XtNheight, 25); n++;
-    layer_input = XtCreateManagedWidget("layerInput", asciiTextWidgetClass, nav_box, args, n);
+    XtSetArg(args[n], XtNborderWidth, 1); n++;
+    layer_label = XtCreateManagedWidget("layerLabel", labelWidgetClass, nav_box, args, n);
+    
+    /* Jump button */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "Jump"); n++;
+    button = XtCreateManagedWidget("jump", commandWidgetClass, nav_box, args, n);
+    XtAddCallback(button, XtNcallback, jump_button_callback, NULL);
     
     /* COLUMN 2: Level and Colormap buttons */
     /* Level buttons box (only if multiple levels exist) */
@@ -911,7 +915,7 @@ void axis_button_callback(Widget w, XtPointer client_data, XtPointer call_data) 
         global_pf->slice_axis = axis;
         global_pf->slice_idx = 0;  /* Start at first layer */
         
-        update_layer_input(global_pf);
+        update_layer_label(global_pf);
         update_info_label(global_pf);
         render_slice(global_pf);
     }
@@ -934,7 +938,7 @@ void level_button_callback(Widget w, XtPointer client_data, XtPointer call_data)
             global_pf->slice_idx = max_idx;
         }
         
-        update_layer_input(global_pf);
+        update_layer_label(global_pf);
         update_info_label(global_pf);
         render_slice(global_pf);
     }
@@ -960,21 +964,20 @@ void nav_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
             }
         }
         
-        update_layer_input(global_pf);
+        update_layer_label(global_pf);
         update_info_label(global_pf);
         render_slice(global_pf);
     }
 }
 
-/* Layer input callback - jump to specified layer */
-void layer_input_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+/* Dialog OK callback for layer jump */
+void jump_dialog_ok_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    Widget dialog = (Widget)client_data;
+    Widget shell = XtParent(dialog);
+    
     if (global_pf) {
-        char *text;
-        Arg args[1];
-        XtSetArg(args[0], XtNstring, &text);
-        XtGetValues(layer_input, args, 1);
-        
-        int layer = atoi(text);
+        char *value = XawDialogGetValueString(dialog);
+        int layer = atoi(value);
         int max_idx = global_pf->grid_dims[global_pf->slice_axis];
         
         /* Convert from 1-indexed to 0-indexed and clamp */
@@ -983,21 +986,59 @@ void layer_input_callback(Widget w, XtPointer client_data, XtPointer call_data) 
         if (layer >= max_idx) layer = max_idx - 1;
         
         global_pf->slice_idx = layer;
-        update_layer_input(global_pf);
+        update_layer_label(global_pf);
         update_info_label(global_pf);
         render_slice(global_pf);
     }
+    
+    XtPopdown(shell);
+    XtDestroyWidget(shell);
 }
 
-/* Update layer input text field */
-void update_layer_input(PlotfileData *pf) {
+/* Dialog Cancel callback */
+void jump_dialog_cancel_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    Widget dialog = (Widget)client_data;
+    Widget shell = XtParent(dialog);
+    XtPopdown(shell);
+    XtDestroyWidget(shell);
+}
+
+/* Jump button callback - open dialog to jump to layer */
+void jump_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    if (global_pf) {
+        Arg args[10];
+        int n;
+        Widget dialog, dialog_shell;
+        char prompt[128];
+        int max_idx = global_pf->grid_dims[global_pf->slice_axis];
+        
+        snprintf(prompt, sizeof(prompt), "Jump to layer (1-%d):", max_idx);
+        
+        n = 0;
+        XtSetArg(args[n], XtNtitle, "Jump to Layer"); n++;
+        dialog_shell = XtCreatePopupShell("jumpDialog", transientShellWidgetClass, toplevel, args, n);
+        
+        n = 0;
+        XtSetArg(args[n], XtNlabel, prompt); n++;
+        XtSetArg(args[n], XtNvalue, ""); n++;
+        dialog = XtCreateManagedWidget("dialog", dialogWidgetClass, dialog_shell, args, n);
+        
+        XawDialogAddButton(dialog, "OK", jump_dialog_ok_callback, (XtPointer)dialog);
+        XawDialogAddButton(dialog, "Cancel", jump_dialog_cancel_callback, (XtPointer)dialog);
+        
+        XtPopup(dialog_shell, XtGrabNone);
+    }
+}
+
+/* Update layer display label */
+void update_layer_label(PlotfileData *pf) {
     char text[32];
     int max_idx = pf->grid_dims[pf->slice_axis];
     snprintf(text, sizeof(text), "%d/%d", pf->slice_idx + 1, max_idx);
     
     Arg args[1];
-    XtSetArg(args[0], XtNstring, text);
-    XtSetValues(layer_input, args, 1);
+    XtSetArg(args[0], XtNlabel, text);
+    XtSetValues(layer_label, args, 1);
 }
 
 /* Colormap button callback */
@@ -1515,7 +1556,7 @@ int main(int argc, char **argv) {
     /* Initialize GUI */
     init_gui(&pf, argc, argv);
     
-    update_layer_input(&pf);
+    update_layer_label(&pf);
     update_info_label(&pf);
     render_slice(&pf);
     
@@ -1565,18 +1606,9 @@ int main(int argc, char **argv) {
             }
             
             if (changed) {
-                update_layer_input(global_pf);
+                update_layer_label(global_pf);
                 update_info_label(global_pf);
                 render_slice(global_pf);
-            }
-        }
-        /* Handle Enter key in text input */
-        else if (event.type == KeyPress) {
-            if (event.xkey.window == XtWindow(layer_input)) {
-                KeySym key = XLookupKeysym(&event.xkey, 0);
-                if (key == XK_Return || key == XK_KP_Enter) {
-                    layer_input_callback(layer_input, NULL, NULL);
-                }
             }
         }
         
