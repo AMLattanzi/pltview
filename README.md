@@ -31,40 +31,42 @@ A simple viewer for AMReX plotfiles, inspired by ncview. Available in both **Pyt
 
 ## Installation
 
-### Python Version
+### Via pip (Recommended)
 
-#### From Git Repository
+The C version will be automatically built during installation if X11 development libraries are available:
+
+```bash
+# Install from git repository
+pip install git+https://github.com/wang1202/pltview.git
+
+# The 'pltview' command will automatically use the C version if available,
+# otherwise fall back to the Python version
+```
+
+**Prerequisites for C version:**
+- **macOS**: Install XQuartz from https://www.xquartz.org/
+- **Linux**: Install X11 development libraries:
+  - Debian/Ubuntu: `sudo apt-get install libx11-dev libxt-dev libxaw7-dev libxmu-dev`
+  - RHEL/CentOS: `sudo yum install libX11-devel libXt-devel libXaw-devel libXmu-devel`
+
+### From Git Repository (Development)
 
 ```bash
 # Clone the repository
 git clone https://github.com/wang1202/pltview.git
 cd pltview
 
-# Install in editable mode
+# Install in editable mode (builds C version automatically)
 pip install -e .
 ```
 
-#### Development Installation
+### Manual C Build
+
+If you want to build only the C version without pip:
 
 ```bash
-# With virtual environment (recommended)
-python -m venv .venv
-source .venv/bin/activate  # On macOS/Linux
-pip install -e .
-```
-
-### C Version (Fast)
-
-```bash
-# Requires X11 development libraries
-# On macOS: Install XQuartz from https://www.xquartz.org/
-# On Linux: sudo apt-get install libx11-dev (Debian/Ubuntu)
-#           or: sudo yum install libX11-devel (RHEL/CentOS)
-
-# Build
+cd pltview
 make
-
-# Run
 ./pltview_c plt00100
 ```
 
@@ -76,24 +78,24 @@ make
 
 ## Usage
 
-### Python Version
-
-After installation, you can run pltview from anywhere:
+After installation, simply run:
 
 ```bash
-# Run with plotfile directory
+# Automatically uses C version if available, otherwise Python version
 pltview plt00100
 
-# Or use the Python module directly
-python -m pltview plt00100
+# Force Python version
+pltview-py plt00100
+
+# Direct C version (if installed to PATH)
+pltview_c plt00100
 ```
 
-### C Version
+The `pltview` command will intelligently choose:
+1. **C version** if available and DISPLAY is set (X11 available)
+2. **Python version** as fallback
 
-```bash
-# Direct execution
-./pltview_c plt00100
-```
+This gives you the best performance automatically!
 
 ## Controls
 

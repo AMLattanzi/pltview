@@ -29,12 +29,17 @@ dependencies = [
     "matplotlib>=3.0.0",
 ]
 
+[project.optional-dependencies]
+c = []  # C version has no Python dependencies beyond the base requirements
+
 [project.scripts]
-pltview = "pltview:main"
+pltview = "pltview_wrapper:main"
+pltview-py = "pltview:main"
 
 [project.urls]
 Homepage = "https://github.com/wang1202/pltview"
 Repository = "https://github.com/wang1202/pltview"
 
 [tool.setuptools]
-py-modules = ["pltview"]
+py-modules = ["pltview", "pltview_wrapper"]
+include-package-data = true

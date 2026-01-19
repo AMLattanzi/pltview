@@ -58,9 +58,26 @@ typedef struct {
     unsigned char r, g, b;
 } RGB;
 
+/* Plot data for popup window */
+typedef struct {
+    double *data;
+    double *x_values;  /* X-axis coordinate values */
+    int n_points;
+    double vmin, vmax;
+    double xmin, xmax;  /* X-axis range */
+    char title[128];
+    char xlabel[64];    /* X-axis label */
+} PlotData;
+
+/* Popup window data */
+typedef struct {
+    Widget shell;
+    PlotData *plot_data_array[3];
+} PopupData;
+
 /* X11 globals */
 Display *display;
-Widget toplevel, form, canvas_widget, var_box, info_label, slice_scroll;
+Widget toplevel, form, canvas_widget, var_box, info_label;
 Widget axis_box, cmap_box, nav_box, colorbar_widget;
 Window canvas, colorbar;
 GC gc, text_gc, colorbar_gc;
@@ -72,6 +89,13 @@ int canvas_height = 600;
 Pixmap pixmap, colorbar_pixmap;
 XFontStruct *font;
 double current_vmin = 0, current_vmax = 1;
+
+/* Current slice rendering info for mouse interaction */
+double *current_slice_data = NULL;
+int slice_width = 0, slice_height = 0;
+int render_offset_x = 0, render_offset_y = 0;
+int render_width = 0, render_height = 0;
+char hover_value_text[256] = "";
 
 /* Function prototypes */
 int read_header(PlotfileData *pf);
@@ -94,9 +118,10 @@ void update_info_label(PlotfileData *pf);
 void var_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void axis_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void nav_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
-void scroll_callback(Widget w, XtPointer client_data, XtPointer call_data);
-void jump_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void canvas_expose_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void canvas_motion_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch);
+void canvas_button_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch);
+void show_line_profiles(PlotfileData *pf, int data_x, int data_y);
 void cleanup(PlotfileData *pf);
 
 /* Global pointer for callbacks */
@@ -494,6 +519,7 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     snprintf(label_text, sizeof(label_text), "PLTView - Loading...");
     n = 0;
     XtSetArg(args[n], XtNlabel, label_text); n++;
+    XtSetArg(args[n], XtNwidth, 900); n++;
     XtSetArg(args[n], XtNborderWidth, 1); n++;
     XtSetArg(args[n], XtNtop, XawChainTop); n++;
     XtSetArg(args[n], XtNleft, XawChainLeft); n++;
@@ -552,7 +578,41 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
         XtAddCallback(button, XtNcallback, axis_button_callback, (XtPointer)(long)i);
     }
     
-    /* Bottom controls removed - use keyboard only */
+    /* Colormap buttons */
+    n = 0;
+    XtSetArg(args[n], XtNfromVert, axis_box); n++;
+    XtSetArg(args[n], XtNfromHoriz, var_box); n++;
+    XtSetArg(args[n], XtNborderWidth, 1); n++;
+    XtSetArg(args[n], XtNorientation, XtorientHorizontal); n++;
+    XtSetArg(args[n], XtNbottom, XawChainBottom); n++;
+    XtSetArg(args[n], XtNleft, XawChainLeft); n++;
+    cmap_box = XtCreateManagedWidget("cmapBox", boxWidgetClass, form, args, n);
+    
+    const char *cmap_labels[] = {"viridis", "jet", "turbo", "plasma"};
+    for (i = 0; i < 4; i++) {
+        n = 0;
+        XtSetArg(args[n], XtNlabel, cmap_labels[i]); n++;
+        button = XtCreateManagedWidget(cmap_labels[i], commandWidgetClass, cmap_box, args, n);
+        XtAddCallback(button, XtNcallback, cmap_button_callback, (XtPointer)(long)i);
+    }
+    
+    /* Navigation buttons (+/-) */
+    n = 0;
+    XtSetArg(args[n], XtNfromVert, cmap_box); n++;
+    XtSetArg(args[n], XtNfromHoriz, var_box); n++;
+    XtSetArg(args[n], XtNborderWidth, 1); n++;
+    XtSetArg(args[n], XtNorientation, XtorientHorizontal); n++;
+    XtSetArg(args[n], XtNbottom, XawChainBottom); n++;
+    XtSetArg(args[n], XtNleft, XawChainLeft); n++;
+    nav_box = XtCreateManagedWidget("navBox", boxWidgetClass, form, args, n);
+    
+    const char *nav_labels[] = {"-", "+"};
+    for (i = 0; i < 2; i++) {
+        n = 0;
+        XtSetArg(args[n], XtNlabel, nav_labels[i]); n++;
+        button = XtCreateManagedWidget(nav_labels[i], commandWidgetClass, nav_box, args, n);
+        XtAddCallback(button, XtNcallback, nav_button_callback, (XtPointer)(long)i);
+    }
     
     /* Colorbar widget */
     n = 0;
@@ -565,20 +625,6 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     XtSetArg(args[n], XtNbottom, XawChainBottom); n++;
     XtSetArg(args[n], XtNright, XawChainRight); n++;
     colorbar_widget = XtCreateManagedWidget("colorbar", simpleWidgetClass, form, args, n);
-    
-    /* Slice scrollbar */
-    n = 0;
-    XtSetArg(args[n], XtNfromVert, nav_box); n++;
-    XtSetArg(args[n], XtNfromHoriz, var_box); n++;
-    XtSetArg(args[n], XtNwidth, 400); n++;
-    XtSetArg(args[n], XtNheight, 20); n++;
-    XtSetArg(args[n], XtNorientation, XtorientHorizontal); n++;
-    XtSetArg(args[n], XtNbottom, XawChainBottom); n++;
-    XtSetArg(args[n], XtNleft, XawChainLeft); n++;
-    XtSetArg(args[n], XtNright, XawChainRight); n++;
-    slice_scroll = XtCreateManagedWidget("sliceScroll", scrollbarWidgetClass, form, args, n);
-    XtAddCallback(slice_scroll, XtNscrollProc, scroll_callback, NULL);
-    XtAddCallback(slice_scroll, XtNjumpProc, jump_callback, NULL);
     
     XtRealizeWidget(toplevel);
     
@@ -609,22 +655,36 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
                                    DefaultDepth(display, screen));
     
     /* Add event handlers */
-    XSelectInput(display, canvas, ExposureMask | KeyPressMask);
+    XSelectInput(display, canvas, ExposureMask | KeyPressMask | PointerMotionMask | ButtonPressMask);
     XSelectInput(display, colorbar, ExposureMask);
+    
+    /* Add mouse event handlers - use raw event handler for proper event handling */
+    XtAddRawEventHandler(canvas_widget, PointerMotionMask, False, canvas_motion_handler, NULL);
+    XtAddRawEventHandler(canvas_widget, ButtonPressMask, False, canvas_button_handler, NULL);
 }
 
 /* Update info label */
 void update_info_label(PlotfileData *pf) {
-    char text[256];
+    char text[512];
     const char *axis_names[] = {"X", "Y", "Z"};
-    int max_idx = pf->grid_dims[pf->slice_axis] - 1;
+    int max_idx = pf->grid_dims[pf->slice_axis];
     
-    snprintf(text, sizeof(text), 
-             "%s | Axis: %s | Layer: %d/%d | Time: %.3f",
-             pf->variables[pf->current_var],
-             axis_names[pf->slice_axis],
-             pf->slice_idx, max_idx,
-             pf->time);
+    if (hover_value_text[0] != '\0') {
+        snprintf(text, sizeof(text), 
+                 "%s | Axis: %s | Layer: %d/%d | Time: %.3f | %s",
+                 pf->variables[pf->current_var],
+                 axis_names[pf->slice_axis],
+                 pf->slice_idx + 1, max_idx,
+                 pf->time,
+                 hover_value_text);
+    } else {
+        snprintf(text, sizeof(text), 
+                 "%s | Axis: %s | Layer: %d/%d | Time: %.3f",
+                 pf->variables[pf->current_var],
+                 axis_names[pf->slice_axis],
+                 pf->slice_idx + 1, max_idx,
+                 pf->time);
+    }
     
     Arg args[1];
     XtSetArg(args[0], XtNlabel, text);
@@ -669,45 +729,6 @@ void nav_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
         update_info_label(global_pf);
         render_slice(global_pf);
     }
-}
-
-/* Scrollbar scroll callback (for dragging) */
-void scroll_callback(Widget w, XtPointer client_data, XtPointer call_data) {
-    if (!global_pf) return;
-    
-    int pixels = (int)(long)call_data;
-    int max_idx = global_pf->grid_dims[global_pf->slice_axis] - 1;
-    
-    /* Increment or decrement based on scroll direction */
-    if (pixels > 0 && global_pf->slice_idx < max_idx) {
-        global_pf->slice_idx++;
-    } else if (pixels < 0 && global_pf->slice_idx > 0) {
-        global_pf->slice_idx--;
-    }
-    
-    /* Update scrollbar position */
-    Arg args[1];
-    float percent = (max_idx > 0) ? (float)global_pf->slice_idx / max_idx : 0.0;
-    XtSetArg(args[0], XtNtopOfThumb, percent);
-    XtSetValues(slice_scroll, args, 1);
-    
-    update_info_label(global_pf);
-    render_slice(global_pf);
-}
-
-/* Scrollbar jump callback (for clicking on bar) */
-void jump_callback(Widget w, XtPointer client_data, XtPointer call_data) {
-    if (!global_pf || !call_data) return;
-    
-    float percent = *(float *)call_data;
-    int max_idx = global_pf->grid_dims[global_pf->slice_axis] - 1;
-    
-    global_pf->slice_idx = (int)(percent * max_idx + 0.5);
-    if (global_pf->slice_idx > max_idx) global_pf->slice_idx = max_idx;
-    if (global_pf->slice_idx < 0) global_pf->slice_idx = 0;
-    
-    update_info_label(global_pf);
-    render_slice(global_pf);
 }
 
 /* Colormap button callback */
@@ -755,6 +776,13 @@ void render_slice(PlotfileData *pf) {
     slice = (double *)malloc(width * height * sizeof(double));
     extract_slice(pf, slice, pf->slice_axis, pf->slice_idx);
     
+    /* Store current slice for mouse interaction */
+    if (current_slice_data) free(current_slice_data);
+    current_slice_data = (double *)malloc(width * height * sizeof(double));
+    memcpy(current_slice_data, slice, width * height * sizeof(double));
+    slice_width = width;
+    slice_height = height;
+    
     /* Find min/max */
     for (i = 0; i < width * height; i++) {
         if (slice[i] < vmin) vmin = slice[i];
@@ -776,7 +804,7 @@ void render_slice(PlotfileData *pf) {
     double data_aspect = (double)width / height;
     double canvas_aspect = (double)canvas_width / canvas_height;
     
-    int render_width, render_height, offset_x, offset_y;
+    int offset_x, offset_y;
     if (data_aspect > canvas_aspect) {
         /* Width-limited */
         render_width = canvas_width;
@@ -790,6 +818,10 @@ void render_slice(PlotfileData *pf) {
         offset_x = (canvas_width - render_width) / 2;
         offset_y = 0;
     }
+    
+    /* Store rendering parameters for mouse interaction */
+    render_offset_x = offset_x;
+    render_offset_y = offset_y;
     
     /* Draw pixels as filled rectangles with correct aspect ratio */
     double pixel_width = (double)render_width / width;
@@ -824,15 +856,361 @@ void render_slice(PlotfileData *pf) {
     XFlush(display);
     
     printf("Rendered: %s, slice %d/%d (%.3e to %.3e)\n", 
-           pf->variables[pf->current_var], pf->slice_idx,
-           pf->grid_dims[pf->slice_axis]-1, vmin, vmax);
+           pf->variables[pf->current_var], pf->slice_idx + 1,
+           pf->grid_dims[pf->slice_axis], vmin, vmax);
     
     free(slice);
+}
+
+/* Mouse motion handler - show value at cursor */
+void canvas_motion_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch) {
+    if (!global_pf || !current_slice_data) return;
+    
+    int mouse_x = event->xmotion.x;
+    int mouse_y = event->xmotion.y;
+    
+    /* Convert mouse coordinates to data coordinates */
+    if (mouse_x < render_offset_x || mouse_x >= render_offset_x + render_width ||
+        mouse_y < render_offset_y || mouse_y >= render_offset_y + render_height) {
+        /* Outside data region - clear hover text */
+        if (hover_value_text[0] != '\0') {
+            hover_value_text[0] = '\0';
+            update_info_label(global_pf);
+        }
+        return;
+    }
+    
+    int data_x = (int)((mouse_x - render_offset_x) * slice_width / (double)render_width);
+    int data_y = (int)((mouse_y - render_offset_y) * slice_height / (double)render_height);
+    
+    if (data_x >= 0 && data_x < slice_width && data_y >= 0 && data_y < slice_height) {
+        double value = current_slice_data[data_y * slice_width + data_x];
+        
+        /* Update hover value text and info label */
+        snprintf(hover_value_text, sizeof(hover_value_text), "[%d,%d]: %.6e", data_x, data_y, value);
+        update_info_label(global_pf);
+    }
+}
+
+/* Mouse button handler - show line profiles through clicked point */
+void canvas_button_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch) {
+    if (!global_pf || !current_slice_data) return;
+    
+    if (event->xbutton.button != Button1) return;
+    
+    int mouse_x = event->xbutton.x;
+    int mouse_y = event->xbutton.y;
+    
+    /* Convert mouse coordinates to data coordinates */
+    if (mouse_x < render_offset_x || mouse_x >= render_offset_x + render_width ||
+        mouse_y < render_offset_y || mouse_y >= render_offset_y + render_height) {
+        return;
+    }
+    
+    int data_x = (int)((mouse_x - render_offset_x) * slice_width / (double)render_width);
+    int data_y = (int)((mouse_y - render_offset_y) * slice_height / (double)render_height);
+    
+    if (data_x >= 0 && data_x < slice_width && data_y >= 0 && data_y < slice_height) {
+        show_line_profiles(global_pf, data_x, data_y);
+    }
+}
+
+/* Draw a line plot on a window */
+void draw_line_plot(Display *dpy, Window win, GC plot_gc, double *data, double *x_values,
+                   int n_points, int width, int height, double vmin, double vmax, 
+                   double xmin, double xmax, const char *title, const char *xlabel) {
+    /* Clear background */
+    XSetForeground(dpy, plot_gc, WhitePixel(dpy, screen));
+    XFillRectangle(dpy, win, plot_gc, 0, 0, width, height);
+    
+    /* Draw border */
+    XSetForeground(dpy, plot_gc, BlackPixel(dpy, screen));
+    XDrawRectangle(dpy, win, plot_gc, 0, 0, width - 1, height - 1);
+    
+    /* Draw title */
+    if (font) {
+        XSetFont(dpy, plot_gc, font->fid);
+        XDrawString(dpy, win, plot_gc, 10, 20, title, strlen(title));
+    }
+    
+    /* Plot area */
+    int plot_left = 50;
+    int plot_right = width - 20;
+    int plot_top = 40;
+    int plot_bottom = height - 45;  /* More space for x-axis labels */
+    int plot_width = plot_right - plot_left;
+    int plot_height = plot_bottom - plot_top;
+    
+    if (plot_width <= 0 || plot_height <= 0 || n_points < 2) return;
+    
+    /* Draw axes */
+    XDrawLine(dpy, win, plot_gc, plot_left, plot_bottom, plot_right, plot_bottom);  /* x-axis */
+    XDrawLine(dpy, win, plot_gc, plot_left, plot_top, plot_left, plot_bottom);      /* y-axis */
+    
+    /* Draw y-axis ticks and labels */
+    char label[64];
+    int num_y_ticks = 4;
+    for (int i = 0; i <= num_y_ticks; i++) {
+        double y_val = vmin + (vmax - vmin) * i / num_y_ticks;
+        int y_pos = plot_bottom - (int)(plot_height * i / num_y_ticks);
+        
+        /* Draw tick mark */
+        XDrawLine(dpy, win, plot_gc, plot_left - 3, y_pos, plot_left, y_pos);
+        
+        /* Draw label */
+        snprintf(label, sizeof(label), "%.2e", y_val);
+        XDrawString(dpy, win, plot_gc, 5, y_pos + 4, label, strlen(label));
+    }
+    
+    /* Draw x-axis ticks and labels */
+    int num_x_ticks = 10;
+    for (int i = 0; i <= num_x_ticks; i++) {
+        double x_val = xmin + (xmax - xmin) * i / num_x_ticks;
+        int x_pos = plot_left + (int)(plot_width * i / num_x_ticks);
+        
+        /* Draw tick mark */
+        XDrawLine(dpy, win, plot_gc, x_pos, plot_bottom, x_pos, plot_bottom + 3);
+        
+        /* Draw label */
+        snprintf(label, sizeof(label), "%.0f", x_val);
+        int label_width = XTextWidth(font, label, strlen(label));
+        XDrawString(dpy, win, plot_gc, x_pos - label_width / 2, plot_bottom + 14, label, strlen(label));
+    }
+    
+    /* Draw x-axis label */
+    if (xlabel && xlabel[0]) {
+        int xlabel_width = XTextWidth(font, xlabel, strlen(xlabel));
+        XDrawString(dpy, win, plot_gc, plot_left + (plot_width - xlabel_width) / 2, 
+                   plot_bottom + 28, xlabel, strlen(xlabel));
+    }
+    
+    /* Draw line plot */
+    XSetForeground(dpy, plot_gc, 0x0000FF);  /* Blue */
+    double range = vmax - vmin;
+    if (range == 0) range = 1;
+    double xrange = xmax - xmin;
+    if (xrange == 0) xrange = 1;
+    
+    for (int i = 0; i < n_points - 1; i++) {
+        int x1 = plot_left + (int)((x_values[i] - xmin) / xrange * plot_width);
+        int x2 = plot_left + (int)((x_values[i + 1] - xmin) / xrange * plot_width);
+        int y1 = plot_bottom - (int)((data[i] - vmin) / range * plot_height);
+        int y2 = plot_bottom - (int)((data[i + 1] - vmin) / range * plot_height);
+        
+        /* Clamp to plot area */
+        if (y1 < plot_top) y1 = plot_top;
+        if (y1 > plot_bottom) y1 = plot_bottom;
+        if (y2 < plot_top) y2 = plot_top;
+        if (y2 > plot_bottom) y2 = plot_bottom;
+        
+        XDrawLine(dpy, win, plot_gc, x1, y1, x2, y2);
+    }
+    
+    XFlush(dpy);
+}
+
+/* Expose event handler for plot canvas */
+void plot_expose_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch) {
+    if (event->type != Expose) return;
+    
+    PlotData *plot_data = (PlotData *)client_data;
+    if (!plot_data || !plot_data->data) return;
+    
+    Window win = XtWindow(w);
+    if (!win) return;
+    
+    Dimension width, height;
+    XtVaGetValues(w, XtNwidth, &width, XtNheight, &height, NULL);
+    
+    GC plot_gc = XCreateGC(display, win, 0, NULL);
+    draw_line_plot(display, win, plot_gc, plot_data->data, plot_data->x_values,
+                   plot_data->n_points, width, height, plot_data->vmin, plot_data->vmax,
+                   plot_data->xmin, plot_data->xmax, plot_data->title, plot_data->xlabel);
+    XFreeGC(display, plot_gc);
+}
+
+/* Callback to destroy popup and free data */
+void close_popup_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    PopupData *popup_data = (PopupData *)client_data;
+    
+    if (popup_data) {
+        /* Free plot data */
+        for (int i = 0; i < 3; i++) {
+            if (popup_data->plot_data_array[i]) {
+                if (popup_data->plot_data_array[i]->data) 
+                    free(popup_data->plot_data_array[i]->data);
+                if (popup_data->plot_data_array[i]->x_values)
+                    free(popup_data->plot_data_array[i]->x_values);
+                free(popup_data->plot_data_array[i]);
+            }
+        }
+        
+        /* Destroy the popup shell */
+        XtDestroyWidget(popup_data->shell);
+        
+        /* Free the popup data structure */
+        free(popup_data);
+    }
+}
+
+/* Show 1D line profiles through clicked point along x, y, z */
+void show_line_profiles(PlotfileData *pf, int data_x, int data_y) {
+    /* Get 3D coordinates based on current slice */
+    int x_coord, y_coord, z_coord;
+    
+    if (pf->slice_axis == 2) {  /* Z slice */
+        x_coord = data_x;
+        y_coord = data_y;
+        z_coord = pf->slice_idx;
+    } else if (pf->slice_axis == 1) {  /* Y slice */
+        x_coord = data_x;
+        y_coord = pf->slice_idx;
+        z_coord = data_y;
+    } else {  /* X slice */
+        x_coord = pf->slice_idx;
+        y_coord = data_x;
+        z_coord = data_y;
+    }
+    
+    /* Create plot data structures */
+    PlotData *x_plot_data = (PlotData *)malloc(sizeof(PlotData));
+    PlotData *y_plot_data = (PlotData *)malloc(sizeof(PlotData));
+    PlotData *z_plot_data = (PlotData *)malloc(sizeof(PlotData));
+    
+    /* Extract and store X profile data */
+    x_plot_data->n_points = pf->grid_dims[0];
+    x_plot_data->data = (double *)malloc(pf->grid_dims[0] * sizeof(double));
+    x_plot_data->x_values = (double *)malloc(pf->grid_dims[0] * sizeof(double));
+    x_plot_data->vmin = 1e30;
+    x_plot_data->vmax = -1e30;
+    for (int i = 0; i < pf->grid_dims[0]; i++) {
+        x_plot_data->x_values[i] = i;
+        int idx = z_coord * pf->grid_dims[0] * pf->grid_dims[1] + y_coord * pf->grid_dims[0] + i;
+        x_plot_data->data[i] = pf->data[idx];
+        if (x_plot_data->data[i] < x_plot_data->vmin) x_plot_data->vmin = x_plot_data->data[i];
+        if (x_plot_data->data[i] > x_plot_data->vmax) x_plot_data->vmax = x_plot_data->data[i];
+    }
+    x_plot_data->xmin = 0;
+    x_plot_data->xmax = pf->grid_dims[0] - 1;
+    snprintf(x_plot_data->title, sizeof(x_plot_data->title), "%s along X (Y=%d, Z=%d)", 
+             pf->variables[pf->current_var], y_coord, z_coord);
+    snprintf(x_plot_data->xlabel, sizeof(x_plot_data->xlabel), "X");
+    
+    /* Extract and store Y profile data */
+    y_plot_data->n_points = pf->grid_dims[1];
+    y_plot_data->data = (double *)malloc(pf->grid_dims[1] * sizeof(double));
+    y_plot_data->x_values = (double *)malloc(pf->grid_dims[1] * sizeof(double));
+    y_plot_data->vmin = 1e30;
+    y_plot_data->vmax = -1e30;
+    for (int j = 0; j < pf->grid_dims[1]; j++) {
+        y_plot_data->x_values[j] = j;
+        int idx = z_coord * pf->grid_dims[0] * pf->grid_dims[1] + j * pf->grid_dims[0] + x_coord;
+        y_plot_data->data[j] = pf->data[idx];
+        if (y_plot_data->data[j] < y_plot_data->vmin) y_plot_data->vmin = y_plot_data->data[j];
+        if (y_plot_data->data[j] > y_plot_data->vmax) y_plot_data->vmax = y_plot_data->data[j];
+    }
+    y_plot_data->xmin = 0;
+    y_plot_data->xmax = pf->grid_dims[1] - 1;
+    snprintf(y_plot_data->title, sizeof(y_plot_data->title), "%s along Y (X=%d, Z=%d)", 
+             pf->variables[pf->current_var], x_coord, z_coord);
+    snprintf(y_plot_data->xlabel, sizeof(y_plot_data->xlabel), "Y");
+    
+    /* Extract and store Z profile data */
+    z_plot_data->n_points = pf->grid_dims[2];
+    z_plot_data->data = (double *)malloc(pf->grid_dims[2] * sizeof(double));
+    z_plot_data->x_values = (double *)malloc(pf->grid_dims[2] * sizeof(double));
+    z_plot_data->vmin = 1e30;
+    z_plot_data->vmax = -1e30;
+    for (int k = 0; k < pf->grid_dims[2]; k++) {
+        z_plot_data->x_values[k] = k;
+        int idx = k * pf->grid_dims[0] * pf->grid_dims[1] + y_coord * pf->grid_dims[0] + x_coord;
+        z_plot_data->data[k] = pf->data[idx];
+        if (z_plot_data->data[k] < z_plot_data->vmin) z_plot_data->vmin = z_plot_data->data[k];
+        if (z_plot_data->data[k] > z_plot_data->vmax) z_plot_data->vmax = z_plot_data->data[k];
+    }
+    z_plot_data->xmin = 0;
+    z_plot_data->xmax = pf->grid_dims[2] - 1;
+    snprintf(z_plot_data->title, sizeof(z_plot_data->title), "%s along Z (X=%d, Y=%d)", 
+             pf->variables[pf->current_var], x_coord, y_coord);
+    snprintf(z_plot_data->xlabel, sizeof(z_plot_data->xlabel), "Z");
+    
+    /* Create popup data structure */
+    PopupData *popup_data = (PopupData *)malloc(sizeof(PopupData));
+    popup_data->plot_data_array[0] = x_plot_data;
+    popup_data->plot_data_array[1] = y_plot_data;
+    popup_data->plot_data_array[2] = z_plot_data;
+    
+    /* Create popup shell */
+    Widget popup_shell = XtVaCreatePopupShell("Line Profiles",
+        transientShellWidgetClass, toplevel,
+        XtNwidth, 900,
+        XtNheight, 700,
+        NULL);
+    
+    /* Store shell in popup data */
+    popup_data->shell = popup_shell;
+    
+    Widget popup_form = XtVaCreateManagedWidget("form",
+        formWidgetClass, popup_shell,
+        NULL);
+    
+    /* Title label */
+    char title_text[256];
+    snprintf(title_text, sizeof(title_text),
+             "Line profiles through [%d,%d] at 3D position [%d,%d,%d]",
+             data_x, data_y, x_coord, y_coord, z_coord);
+    Widget title_label = XtVaCreateManagedWidget("title",
+        labelWidgetClass, popup_form,
+        XtNlabel, title_text,
+        XtNwidth, 880,
+        NULL);
+    
+    /* Create three plot canvases with expose event handlers */
+    Widget x_canvas = XtVaCreateManagedWidget("x_plot",
+        simpleWidgetClass, popup_form,
+        XtNfromVert, title_label,
+        XtNwidth, 880,
+        XtNheight, 180,
+        XtNborderWidth, 1,
+        NULL);
+    
+    Widget y_canvas = XtVaCreateManagedWidget("y_plot",
+        simpleWidgetClass, popup_form,
+        XtNfromVert, x_canvas,
+        XtNwidth, 880,
+        XtNheight, 180,
+        XtNborderWidth, 1,
+        NULL);
+    
+    Widget z_canvas = XtVaCreateManagedWidget("z_plot",
+        simpleWidgetClass, popup_form,
+        XtNfromVert, y_canvas,
+        XtNwidth, 880,
+        XtNheight, 180,
+        XtNborderWidth, 1,
+        NULL);
+    
+    /* Add expose event handlers to all three canvases */
+    XtAddEventHandler(x_canvas, ExposureMask, False, plot_expose_handler, x_plot_data);
+    XtAddEventHandler(y_canvas, ExposureMask, False, plot_expose_handler, y_plot_data);
+    XtAddEventHandler(z_canvas, ExposureMask, False, plot_expose_handler, z_plot_data);
+    
+    /* Close button */
+    Widget close_button = XtVaCreateManagedWidget("Close",
+        commandWidgetClass, popup_form,
+        XtNfromVert, z_canvas,
+        NULL);
+    
+    XtAddCallback(close_button, XtNcallback, close_popup_callback, popup_data);
+    
+    /* Show popup */
+    XtPopup(popup_shell, XtGrabNone);
 }
 
 void cleanup(PlotfileData *pf) {
     if (pf->data) free(pf->data);
     if (pixel_data) free(pixel_data);
+    if (current_slice_data) free(current_slice_data);
 }
 
 int main(int argc, char **argv) {
@@ -866,8 +1244,8 @@ int main(int argc, char **argv) {
     printf("\nGUI Controls:\n");
     printf("  Click variable buttons to change variable\n");
     printf("  Click X/Y/Z buttons to switch axis\n");
-    printf("  Use keyboard: +/- or arrow keys to navigate layers\n");
-    printf("  Use keyboard: 0-3 for colormaps (0=viridis, 1=jet, 2=turbo, 3=plasma)\n\n");
+    printf("  Click colormap buttons (viridis/jet/turbo/plasma)\n");
+    printf("  Click +/- buttons to navigate layers (or use keyboard arrows)\n\n");
     
     /* Main event loop with expose and keyboard handling */
     XtAppContext app_context = XtWidgetToApplicationContext(toplevel);
