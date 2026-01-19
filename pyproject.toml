@@ -20,6 +20,12 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Visualization",
 ]
 
+[project.scripts]
+pltview = "pltview_entry:main"
+
 [project.urls]
 Homepage = "https://github.com/wang1202/pltview"
 Repository = "https://github.com/wang1202/pltview"
+
+[tool.setuptools]
+py-modules = ["pltview_entry"]

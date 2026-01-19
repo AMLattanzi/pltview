@@ -72,6 +72,8 @@ class EditableWheel(editable_wheel):
     """Custom editable_wheel command to build C binary"""
     
     def run(self):
+        # Build the C binary before creating the wheel
+        print("Running editable_wheel - building C binary...")
         build_c_binary()
         super().run()
 
@@ -81,22 +83,10 @@ class InstallC(install):
     
     def run(self):
         # Build first
-        self.run_command('build')
+        build_c_binary()
         
         # Run normal install
         super().run()
-        
-        # Install the C binary
-        if os.path.exists('pltview'):
-            scripts_dir = os.path.join(self.install_scripts)
-            os.makedirs(scripts_dir, exist_ok=True)
-            dest = os.path.join(scripts_dir, 'pltview')
-            print(f"Installing pltview to {dest}")
-            shutil.copy2('pltview', dest)
-            os.chmod(dest, 0o755)
-            print("✓ Installation complete!")
-        else:
-            raise RuntimeError("pltview binary not found after build")
 
 
 class DevelopC(develop):
@@ -104,29 +94,11 @@ class DevelopC(develop):
     
     def run(self):
         # Build the C version in the source directory
+        print("Running develop - building C binary...")
         build_c_binary()
         
         # Run normal develop
         super().run()
-        
-        # Create symlink in scripts directory
-        if os.path.exists('pltview'):
-            scripts_dir = os.path.join(self.install_scripts)
-            os.makedirs(scripts_dir, exist_ok=True)
-            dest = os.path.join(scripts_dir, 'pltview')
-            src = os.path.abspath('pltview')
-            
-            # Remove existing file/link
-            if os.path.exists(dest) or os.path.islink(dest):
-                os.remove(dest)
-            
-            # Create symlink
-            os.symlink(src, dest)
-            print(f"Created symlink: {dest} -> {src}")
-            print("✓ Editable installation complete!")
-            print("Note: Run 'make' after modifying pltview.c to rebuild")
-        else:
-            raise RuntimeError("pltview binary not found after build")
 
 
 setup(
