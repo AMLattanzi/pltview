@@ -4,14 +4,38 @@ PLTView - A simple viewer for AMReX plotfiles, inspired by ncview
 """
 
 import os
-# Set DISPLAY environment variable for XQuartz
-if 'DISPLAY' not in os.environ:
+import sys
+import platform
+
+# Set DISPLAY environment variable for XQuartz on macOS
+if 'DISPLAY' not in os.environ and platform.system() == 'Darwin':
     os.environ['DISPLAY'] = ':0'
 
 import numpy as np
 import matplotlib
-# Use macOS backend which works with XQuartz when DISPLAY is set
-matplotlib.use('macosx')
+
+# Choose backend based on platform and environment
+# Allow user to override via MPLBACKEND environment variable
+if 'MPLBACKEND' not in os.environ:
+    if platform.system() == 'Darwin':
+        # macOS - use native backend
+        matplotlib.use('macosx')
+    elif 'DISPLAY' in os.environ:
+        # Linux/Unix with X11 - try TkAgg, fall back to Qt5Agg
+        try:
+            matplotlib.use('TkAgg')
+        except ImportError:
+            try:
+                matplotlib.use('Qt5Agg')
+            except ImportError:
+                print("Warning: No GUI backend available. Using Agg (non-interactive).")
+                matplotlib.use('Agg')
+    else:
+        # Headless server - use Agg for saving images
+        print("Warning: No DISPLAY found. Using Agg backend (non-interactive).")
+        print("To enable interactive mode, set DISPLAY environment variable or use X11 forwarding.")
+        matplotlib.use('Agg')
+
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider, RadioButtons, Button
 import struct
