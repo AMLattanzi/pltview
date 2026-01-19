@@ -4,14 +4,16 @@ A lightweight X11 viewer for AMReX plotfiles, inspired by ncview.
 
 ## Features
 
+- **Direct X11 rendering** with minimal dependencies (10-100x faster than Python alternatives)
 - **Multi-level AMR support**: Automatically detects and visualizes multiple refinement levels
 - **Interactive 3D slicing**: View 2D slices of 3D data along X, Y, Z axes with wrap-around navigation
-- **Rich mouse interaction**:
+- **Mouse interaction**:
   - Hover to see values at cursor position
   - Click to view 1D line profiles along X, Y, Z directions in popup window
-- **8 colormap options**: viridis, jet, turbo, plasma, hot, cool, gray, magma
-- **Intelligent level handling**: Preserves slice position when switching between AMR levels
+- **Multiple colormap options**: viridis, jet, turbo, plasma, hot, cool, gray, magma
+- **Level handling**: Preserves slice position when switching between AMR levels
 - **Dynamic grid adaptation**: Automatically adjusts to different grid dimensions per level
+- **All variables supported**: Displays all available variables (up to 64) in the sidebar
 
 ## Installation
 
@@ -66,7 +68,7 @@ pltview plt00100
 
 **GUI Layout:**
 
-- **Left sidebar**: Variable selection buttons (first 10 variables)
+- **Left sidebar**: Variable selection buttons (all available variables, up to 64 supported)
 - **Main canvas**: Data visualization with white background and aspect ratio preservation
 - **Right colorbar**: Data range and colormap scale
 - **Bottom controls** (organized in 2 columns):

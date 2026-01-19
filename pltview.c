@@ -676,9 +676,8 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     XtSetArg(args[n], XtNleft, XawChainLeft); n++;
     var_box = XtCreateManagedWidget("varBox", boxWidgetClass, form, args, n);
     
-    /* Add variable buttons (limit to first 10) */
-    int max_vars = pf->n_vars < 10 ? pf->n_vars : 10;
-    for (i = 0; i < max_vars; i++) {
+    /* Add variable buttons (all available variables) */
+    for (i = 0; i < pf->n_vars; i++) {
         n = 0;
         XtSetArg(args[n], XtNlabel, pf->variables[i]); n++;
         button = XtCreateManagedWidget(pf->variables[i], commandWidgetClass, var_box, args, n);
