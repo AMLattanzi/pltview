@@ -87,6 +87,19 @@ class InstallC(install):
         
         # Run normal install
         super().run()
+        
+        # Install the C binary to bin directory
+        if os.path.exists('pltview'):
+            scripts_dir = os.path.join(self.install_scripts)
+            os.makedirs(scripts_dir, exist_ok=True)
+            dest = os.path.join(scripts_dir, 'pltview_bin')
+            print(f"Installing pltview binary to {dest}")
+            shutil.copy2('pltview', dest)
+            os.chmod(dest, 0o755)
+            print("✓ Installation complete!")
+        else:
+            print("Warning: pltview binary not found after build")
+            print("The installation will work for editable installs only.")
 
 
 class DevelopC(develop):
