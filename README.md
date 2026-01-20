@@ -1,6 +1,6 @@
 # pltview
 
-A lightweight X11 viewer for AMReX plotfiles, inspired by ncview.
+A lightweight X11 viewer for AMReX plotfiles, inspired by ncview and built with the assistance of Claude Sonnet 4.5.
 
 ## Features
 
