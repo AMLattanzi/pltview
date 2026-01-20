@@ -129,6 +129,8 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 MIT License - see [LICENSE](LICENSE) for details.
 
+Additional government disclaimer - see [DISCLAIMER.md](DISCLAIMER.md).
+
 ## Citation
 
 If you use this package in your research, please consider citing:
