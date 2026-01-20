@@ -625,13 +625,23 @@ void draw_colorbar(double vmin, double vmax, int cmap_type) {
         XFillRectangle(display, colorbar, colorbar_gc, 0, y, width, h);
     }
     
-    /* Draw labels */
+    /* Draw tick marks and labels */
     char text[32];
     XSetForeground(display, text_gc, BlackPixel(display, screen));
-    snprintf(text, sizeof(text), "%.2e", vmax);
-    XDrawString(display, colorbar, text_gc, width + 5, 15, text, strlen(text));
-    snprintf(text, sizeof(text), "%.2e", vmin);
-    XDrawString(display, colorbar, text_gc, width + 5, canvas_height - 5, text, strlen(text));
+    
+    int n_ticks = 11;  /* 11 ticks gives 10 intervals */
+    for (int i = 0; i < n_ticks; i++) {
+        double fraction = (double)i / (n_ticks - 1);
+        double value = vmin + fraction * (vmax - vmin);
+        int y = canvas_height - (int)(fraction * canvas_height);
+        
+        /* Draw tick mark */
+        XDrawLine(display, colorbar, text_gc, width, y, width + 5, y);
+        
+        /* Draw label */
+        snprintf(text, sizeof(text), "%.2e", value);
+        XDrawString(display, colorbar, text_gc, width + 8, y + 4, text, strlen(text));
+    }
     
     XFlush(display);
 }
