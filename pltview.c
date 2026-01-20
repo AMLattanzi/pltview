@@ -607,20 +607,21 @@ void apply_colormap(double *data, int width, int height,
 /* Draw colorbar */
 void draw_colorbar(double vmin, double vmax, int cmap_type) {
     int height = 256, width = 30;
+    int margin = 10;   /* Margin from top and bottom for tick labels */
     
     /* Clear colorbar with white background */
     XSetForeground(display, colorbar_gc, WhitePixel(display, screen));
     XFillRectangle(display, colorbar, colorbar_gc, 0, 0, 100, canvas_height);
     
-    /* Draw colorbar as solid rectangles */
+    /* Draw colorbar as solid rectangles within margins */
     for (int i = 0; i < height; i++) {
         double t = (double)(height - 1 - i) / (height - 1);
         RGB color = get_colormap_rgb(t, cmap_type);
         unsigned long pixel = (color.r << 16) | (color.g << 8) | color.b;
         
         XSetForeground(display, colorbar_gc, pixel);
-        int y = (i * canvas_height) / height;
-        int h = ((i + 1) * canvas_height) / height - y;
+        int y = margin + (i * (canvas_height - 2 * margin)) / height;
+        int h = margin + ((i + 1) * (canvas_height - 2 * margin)) / height - y;
         if (h < 1) h = 1;
         XFillRectangle(display, colorbar, colorbar_gc, 0, y, width, h);
     }
@@ -630,15 +631,18 @@ void draw_colorbar(double vmin, double vmax, int cmap_type) {
     XSetForeground(display, text_gc, BlackPixel(display, screen));
     
     int n_ticks = 11;  /* 11 ticks gives 10 intervals */
+    
     for (int i = 0; i < n_ticks; i++) {
         double fraction = (double)i / (n_ticks - 1);
         double value = vmin + fraction * (vmax - vmin);
-        int y = canvas_height - (int)(fraction * canvas_height);
+        
+        /* Map to drawable area with margins */
+        int y = margin + (canvas_height - 2 * margin) - (int)(fraction * (canvas_height - 2 * margin));
         
         /* Draw tick mark */
         XDrawLine(display, colorbar, text_gc, width, y, width + 5, y);
         
-        /* Draw label */
+        /* Draw label with vertical centering adjustment */
         snprintf(text, sizeof(text), "%.2e", value);
         XDrawString(display, colorbar, text_gc, width + 8, y + 4, text, strlen(text));
     }
