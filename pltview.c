@@ -1715,6 +1715,13 @@ int main(int argc, char **argv) {
         }
         /* Handle keyboard events */
         else if (event.type == KeyPress && global_pf) {
+            /* Only process keyboard shortcuts if the event is from the main canvas window */
+            /* This prevents dialog text input from triggering colormap changes */
+            if (event.xkey.window != canvas) {
+                XtDispatchEvent(&event);
+                continue;
+            }
+            
             KeySym key = XLookupKeysym(&event.xkey, 0);
             int max_idx = global_pf->grid_dims[global_pf->slice_axis] - 1;
             int changed = 0;
