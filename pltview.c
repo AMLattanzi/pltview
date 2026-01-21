@@ -1015,15 +1015,21 @@ void jump_to_layer_callback(Widget w, XtPointer client_data, XtPointer call_data
     XtDestroyWidget(shell);
 }
 
+/* Structure to pass both text widget and shell to callback */
+typedef struct {
+    Widget text_widget;
+    Widget dialog_shell;
+} JumpDialogData;
+
 /* Jump to typed layer number */
 void jump_to_typed_layer_callback(Widget w, XtPointer client_data, XtPointer call_data) {
-    Widget text_widget = (Widget)client_data;
+    JumpDialogData *data = (JumpDialogData *)client_data;
     
-    if (global_pf) {
+    if (global_pf && data) {
         String value;
         Arg args[1];
         XtSetArg(args[0], XtNstring, &value);
-        XtGetValues(text_widget, args, 1);
+        XtGetValues(data->text_widget, args, 1);
         
         if (value && strlen(value) > 0) {
             int layer = atoi(value);
@@ -1039,12 +1045,12 @@ void jump_to_typed_layer_callback(Widget w, XtPointer client_data, XtPointer cal
             update_info_label(global_pf);
             render_slice(global_pf);
         }
+        
+        /* Close the dialog */
+        XtPopdown(data->dialog_shell);
+        XtDestroyWidget(data->dialog_shell);
+        free(data);
     }
-    
-    /* Close the dialog */
-    Widget shell = XtParent(XtParent(XtParent(text_widget)));
-    XtPopdown(shell);
-    XtDestroyWidget(shell);
 }
 
 /* Close jump dialog */
@@ -1092,12 +1098,17 @@ void jump_button_callback(Widget w, XtPointer client_data, XtPointer call_data) 
         XtSetArg(args[n], XtNstring, ""); n++;
         text_widget = XtCreateManagedWidget("textInput", asciiTextWidgetClass, form, args, n);
         
+        /* Create data structure to pass to callback */
+        JumpDialogData *jump_data = malloc(sizeof(JumpDialogData));
+        jump_data->text_widget = text_widget;
+        jump_data->dialog_shell = dialog_shell;
+        
         n = 0;
         XtSetArg(args[n], XtNfromVert, text_label); n++;
         XtSetArg(args[n], XtNfromHoriz, text_widget); n++;
         XtSetArg(args[n], XtNlabel, "Go"); n++;
-        button = XtCreateManagedWidget("go", commandWidgetClass, form, args, n);
-        XtAddCallback(button, XtNcallback, jump_to_typed_layer_callback, (XtPointer)text_widget);
+        button = XtCreateManagedWidget("goButton", commandWidgetClass, form, args, n);
+        XtAddCallback(button, XtNcallback, jump_to_typed_layer_callback, (XtPointer)jump_data);
         
         /* Or quick jump label */
         n = 0;
