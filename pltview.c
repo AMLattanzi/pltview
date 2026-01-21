@@ -100,6 +100,9 @@ int slice_width = 0, slice_height = 0;
 int render_offset_x = 0, render_offset_y = 0;
 int render_width = 0, render_height = 0;
 char hover_value_text[256] = "";
+int initial_focus_set = 0;  /* Flag for setting keyboard focus on first expose */
+int dialog_active = 0;  /* Flag to track when a dialog is open */
+Widget active_text_widget = NULL;  /* Text widget in active dialog */
 
 /* Function prototypes */
 int detect_levels(PlotfileData *pf);
@@ -1013,6 +1016,8 @@ void jump_to_layer_callback(Widget w, XtPointer client_data, XtPointer call_data
     Widget shell = XtParent(XtParent(w));
     XtPopdown(shell);
     XtDestroyWidget(shell);
+    dialog_active = 0;
+    active_text_widget = NULL;
 }
 
 /* Structure to pass both text widget and shell to callback */
@@ -1050,6 +1055,8 @@ void jump_to_typed_layer_callback(Widget w, XtPointer client_data, XtPointer cal
         XtPopdown(data->dialog_shell);
         XtDestroyWidget(data->dialog_shell);
         free(data);
+        dialog_active = 0;
+        active_text_widget = NULL;
     }
 }
 
@@ -1058,6 +1065,8 @@ void jump_dialog_close_callback(Widget w, XtPointer client_data, XtPointer call_
     Widget shell = (Widget)client_data;
     XtPopdown(shell);
     XtDestroyWidget(shell);
+    dialog_active = 0;
+    active_text_widget = NULL;
 }
 
 /* Jump button callback - hybrid dialog with both text input and quick-jump buttons */
@@ -1156,7 +1165,18 @@ void jump_button_callback(Widget w, XtPointer client_data, XtPointer call_data) 
         XtAddCallback(button, XtNcallback, jump_dialog_close_callback, (XtPointer)dialog_shell);
         
         XtRealizeWidget(dialog_shell);
-        XtPopup(dialog_shell, XtGrabNone);
+        XtPopup(dialog_shell, XtGrabExclusive);
+
+        /* Set keyboard focus to text input - needed for remote X11 */
+        XtSetKeyboardFocus(dialog_shell, text_widget);
+
+        /* Force the text widget to accept focus */
+        XSync(display, False);
+        Time time = CurrentTime;
+        XtCallAcceptFocus(text_widget, &time);
+
+        dialog_active = 1;
+        active_text_widget = text_widget;
     }
 }
 
@@ -1338,7 +1358,13 @@ void canvas_motion_handler(Widget w, XtPointer client_data, XEvent *event, Boole
 /* Mouse button handler - show line profiles through clicked point */
 void canvas_button_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch) {
     if (!global_pf || !current_slice_data) return;
-    
+
+    /* Only process events on the canvas window */
+    if (event->xbutton.window != canvas) return;
+
+    /* Set keyboard focus to canvas - needed for remote X11 forwarding */
+    XSetInputFocus(display, canvas, RevertToParent, CurrentTime);
+
     if (event->xbutton.button != Button1) return;
     
     int mouse_x = event->xbutton.x;
@@ -1709,12 +1735,55 @@ int main(int argc, char **argv) {
         if (event.type == Expose) {
             if (event.xexpose.window == canvas && global_pf && global_pf->data) {
                 render_slice(global_pf);
+                /* Set keyboard focus on first expose - needed for remote X11 */
+                if (!initial_focus_set) {
+                    XSetInputFocus(display, canvas, RevertToParent, CurrentTime);
+                    initial_focus_set = 1;
+                }
             } else if (event.xexpose.window == colorbar && global_pf) {
                 draw_colorbar(current_vmin, current_vmax, global_pf->colormap);
             }
         }
         /* Handle keyboard events */
         else if (event.type == KeyPress && global_pf) {
+            /* Handle keyboard input for dialog text widget */
+            if (dialog_active && active_text_widget) {
+                char buf[32];
+                KeySym keysym;
+                int len = XLookupString(&event.xkey, buf, sizeof(buf) - 1, &keysym, NULL);
+
+                /* Get current text */
+                String current_value;
+                Arg args[1];
+                XtSetArg(args[0], XtNstring, &current_value);
+                XtGetValues(active_text_widget, args, 1);
+
+                char new_value[256];
+                strncpy(new_value, current_value ? current_value : "", sizeof(new_value) - 1);
+                new_value[sizeof(new_value) - 1] = '\0';
+                size_t current_len = strlen(new_value);
+
+                if (keysym == XK_BackSpace || keysym == XK_Delete) {
+                    /* Handle backspace */
+                    if (current_len > 0) {
+                        new_value[current_len - 1] = '\0';
+                        XtSetArg(args[0], XtNstring, new_value);
+                        XtSetValues(active_text_widget, args, 1);
+                    }
+                } else if (keysym == XK_Return || keysym == XK_KP_Enter) {
+                    /* Let Enter be handled by dispatch for button activation */
+                    XtDispatchEvent(&event);
+                } else if (len > 0 && isprint((unsigned char)buf[0])) {
+                    /* Append printable character */
+                    if (current_len + len < sizeof(new_value) - 1) {
+                        buf[len] = '\0';
+                        strcat(new_value, buf);
+                        XtSetArg(args[0], XtNstring, new_value);
+                        XtSetValues(active_text_widget, args, 1);
+                    }
+                }
+                continue;
+            }
             /* Only process keyboard shortcuts if the event is from the main canvas window */
             /* This prevents dialog text input from triggering colormap changes */
             if (event.xkey.window != canvas) {
