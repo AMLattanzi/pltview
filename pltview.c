@@ -158,7 +158,7 @@ void canvas_motion_handler(Widget w, XtPointer client_data, XEvent *event, Boole
 void canvas_button_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch);
 void show_line_profiles(PlotfileData *pf, int data_x, int data_y);
 void cleanup(PlotfileData *pf);
-int scan_timesteps(const char *base_dir);
+int scan_timesteps(const char *base_dir, const char *prefix);
 void switch_timestep(PlotfileData *pf, int new_timestep);
 void time_nav_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void update_time_label(void);
@@ -191,11 +191,12 @@ int compare_timesteps(const void *a, const void *b) {
 }
 
 /* Scan directory for plotfiles and sort them by number */
-int scan_timesteps(const char *base_dir) {
+int scan_timesteps(const char *base_dir, const char *prefix) {
     DIR *dir;
     struct dirent *entry;
     char check_path[MAX_PATH];
     int indices[MAX_TIMESTEPS];
+    int prefix_len = strlen(prefix);
 
     dir = opendir(base_dir);
     if (!dir) {
@@ -206,16 +207,16 @@ int scan_timesteps(const char *base_dir) {
     n_timesteps = 0;
 
     while ((entry = readdir(dir)) != NULL && n_timesteps < MAX_TIMESTEPS) {
-        /* Check if entry starts with "plt" */
-        if (strncmp(entry->d_name, "plt", 3) == 0) {
+        /* Check if entry starts with the specified prefix */
+        if (strncmp(entry->d_name, prefix, prefix_len) == 0) {
             /* Check if it's a valid plotfile directory (has Header file) */
             snprintf(check_path, MAX_PATH, "%s/%s/Header", base_dir, entry->d_name);
             FILE *fp = fopen(check_path, "r");
             if (fp) {
                 fclose(fp);
 
-                /* Extract number from plotfile name */
-                int num = atoi(entry->d_name + 3);
+                /* Extract number from plotfile name (after prefix) */
+                int num = atoi(entry->d_name + prefix_len);
 
                 /* Allocate and store path */
                 timestep_paths[n_timesteps] = (char *)malloc(MAX_PATH);
@@ -2856,10 +2857,19 @@ int main(int argc, char **argv) {
     PlotfileData pf = {0};
     Arg args[2];
     char check_path[MAX_PATH];
+    const char *prefix = "plt";  /* Default prefix */
 
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <plotfile_directory or directory_containing_plotfiles>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <plotfile_directory> [prefix]\n", argv[0]);
+        fprintf(stderr, "  Single plotfile:    %s plt00100\n", argv[0]);
+        fprintf(stderr, "  Multi-timestep:     %s /path/to/dir plt\n", argv[0]);
+        fprintf(stderr, "  With prefix plt2d:  %s /path/to/dir plt2d\n", argv[0]);
         return 1;
+    }
+
+    /* Get prefix from argument if provided */
+    if (argc >= 3) {
+        prefix = argv[2];
     }
 
     /* Check if argument is a single plotfile or a directory containing plotfiles */
@@ -2877,8 +2887,9 @@ int main(int argc, char **argv) {
         printf("Single plotfile mode: %s\n", argv[1]);
     } else {
         /* Try multi-timestep mode - scan directory for plotfiles */
-        if (scan_timesteps(argv[1]) <= 0) {
-            fprintf(stderr, "Error: No valid plotfiles found in %s\n", argv[1]);
+        printf("Scanning for plotfiles with prefix '%s'...\n", prefix);
+        if (scan_timesteps(argv[1], prefix) <= 0) {
+            fprintf(stderr, "Error: No valid plotfiles with prefix '%s' found in %s\n", prefix, argv[1]);
             return 1;
         }
         current_timestep = 0;
