@@ -1,6 +1,6 @@
 # pltview
 
-A lightweight X11 viewer for AMReX plotfiles, inspired by ncview and built with the assistance of Claude Sonnet 4.5.
+A lightweight X11 viewer for AMReX plotfiles, inspired by ncview and built with the assistance of Claude.
 
 ![Example Screenshot](Example.png)
 
@@ -8,11 +8,16 @@ A lightweight X11 viewer for AMReX plotfiles, inspired by ncview and built with 
 
 - **Direct X11 rendering** with minimal dependencies (10-100x faster than Python alternatives)
 - **Multi-level AMR support**: Automatically detects and visualizes multiple refinement levels
+- **Multi-timestep support**: Navigate through time series data with `<`/`>` buttons or Left/Right arrow keys
 - **Interactive 3D slicing**: View 2D slices of 3D data along X, Y, Z axes with wrap-around navigation
 - **Mouse interaction**:
   - Hover to see values at cursor position
   - Click to view 1D line profiles along X, Y, Z directions in popup window
-- **Multiple colormap options**: viridis, jet, turbo, plasma, hot, cool, gray, magma
+- **Statistical analysis**:
+  - Profile: View mean, std, and kurtosis along the slicing axis
+  - Distribution: View histogram of values in current layer
+- **Custom colorbar range**: Set min/max values manually or use auto-scaling
+- **Multiple colormap options**: viridis, jet, turbo, plasma, hot, cool, gray, magma (selectable via popup or keys 1-8)
 - **Level handling**: Preserves slice position when switching between AMR levels
 - **Dynamic grid adaptation**: Automatically adjusts to different grid dimensions per level
 - **Variables supported**: Displays all available variables (up to 128) in the sidebar
@@ -63,8 +68,17 @@ make
 After installation:
 
 ```bash
+# Single plotfile
 pltview plt00100
+
+# Multi-timestep mode (directory containing multiple plotfiles)
+pltview /path/to/simulation/output plt
+
+# With different prefix (e.g., plt2d for 2D output)
+pltview /path/to/simulation/output plt2d
 ```
+
+**Multi-timestep mode** automatically scans the directory for plotfiles matching the specified prefix (default: `plt`), sorts them by numerical suffix, and allows navigation between timesteps using `<`/`>` buttons or Left/Right arrow keys.
 
 ## Controls
 
@@ -73,9 +87,11 @@ pltview plt00100
 - **Left sidebar**: Variable selection buttons (all available variables, up to 128 supported)
 - **Main canvas**: Data visualization with white background and aspect ratio preservation
 - **Right colorbar**: Data range and colormap scale
-- **Bottom controls** (organized in 2 columns):
-  - **Column 1**: Axis buttons (X/Y/Z) and navigation (+/-)
-  - **Column 2**: Level selection (Level 0/Level 1/...) and colormap buttons
+- **Bottom controls** (organized in columns):
+  - **Column 1**: Axis (X/Y/Z), Layer navigation (v/^), Jump, Profile
+  - **Column 2**: Colormap, Range, Distrib (distribution histogram)
+  - **Column 3**: Time navigation (`<`/`>`) - appears in multi-timestep mode
+  - **Column 4**: Level selection (Level 0/Level 1/...) - appears when multiple AMR levels detected
 
 **Mouse Interaction:**
 
@@ -86,10 +102,24 @@ pltview plt00100
 
 - **Variable Buttons**: Select which variable to visualize
 - **X/Y/Z Buttons**: Switch viewing axis (perpendicular to slice)
+- **v/^ Buttons**: Navigate through layers with wrap-around
+- **Jump**: Quick jump to specific layer positions (First, 1/4, Middle, 3/4, Last) or type a layer number
+- **Profile**: Show mean, std, and kurtosis statistics along the current axis
+- **Colormap**: Open popup to select from 8 colormaps (1-8: viridis/jet/turbo/plasma/hot/cool/gray/magma)
+- **Range**: Set custom colorbar min/max values, or reset to auto
+- **Distrib**: Show histogram distribution of values in the current layer
+- **</>** Buttons: Navigate through timesteps (multi-timestep mode only)
 - **Level Buttons**: Switch between AMR refinement levels (appears when multiple levels detected)
-- **Colormap Buttons**: Choose from 8 colormaps (viridis/jet/turbo/plasma/hot/cool/gray/magma)
-- **+/- Buttons**: Navigate through slices with wrap-around (layer 1 → - → last layer)
-- **Keyboard**: Arrow keys also navigate slices
+
+**Keyboard Shortcuts:**
+
+| Key | Action |
+|-----|--------|
+| `Up` / `+` / `=` | Next layer |
+| `Down` / `-` / `_` | Previous layer |
+| `Right` | Next timestep (multi-timestep mode) |
+| `Left` | Previous timestep (multi-timestep mode) |
+| `1` - `8` | Select colormap (1=viridis, 2=jet, 3=turbo, 4=plasma, 5=hot, 6=cool, 7=gray, 8=magma) |
 
 **Line Profile Popup:**
 The popup window displays three graphs showing how the variable value changes along each spatial dimension (X, Y, Z) through the clicked point, with proper axis labels and tick marks.
