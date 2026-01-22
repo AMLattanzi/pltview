@@ -767,8 +767,8 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     XtSetArg(args[n], XtNborderWidth, 0); n++;
     XtCreateManagedWidget("layerText", labelWidgetClass, nav_box, args, n);
 
-    /* Navigation buttons (↓/↑) */
-    const char *nav_labels[] = {"↓", "↑"};
+    /* Navigation buttons (v/^) */
+    const char *nav_labels[] = {"v", "^"};
     for (i = 0; i < 2; i++) {
         n = 0;
         XtSetArg(args[n], XtNlabel, nav_labels[i]); n++;
@@ -2716,7 +2716,7 @@ int main(int argc, char **argv) {
         printf("  Click Level 0/Level 1/... buttons to switch level\n");
     }
     printf("  Click Colormap button to select colormap (or use keyboard 1-8)\n");
-    printf("  Click ↓/↑ buttons to navigate layers (or use keyboard Up/Down arrows)\n\n");
+    printf("  Click v/^ buttons to navigate layers (or use keyboard Up/Down arrows)\n\n");
     
     /* Main event loop with expose and keyboard handling */
     XtAppContext app_context = XtWidgetToApplicationContext(toplevel);
