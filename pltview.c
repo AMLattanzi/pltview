@@ -141,6 +141,8 @@ void jump_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void range_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void profile_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void show_slice_statistics(PlotfileData *pf);
+void distribution_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void show_distribution(PlotfileData *pf);
 void update_layer_label(PlotfileData *pf);
 void canvas_expose_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void canvas_motion_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch);
@@ -790,6 +792,12 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     XtSetArg(args[n], XtNlabel, "Profile"); n++;
     button = XtCreateManagedWidget("profile", commandWidgetClass, nav_box, args, n);
     XtAddCallback(button, XtNcallback, profile_button_callback, NULL);
+
+    /* Distribution button for current layer histogram */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "Distrib"); n++;
+    button = XtCreateManagedWidget("distribution", commandWidgetClass, nav_box, args, n);
+    XtAddCallback(button, XtNcallback, distribution_button_callback, NULL);
 
     /* COLUMN 2: Level and Colormap buttons */
     /* Level buttons box (only if multiple levels exist) */
@@ -2281,6 +2289,314 @@ void show_slice_statistics(PlotfileData *pf) {
 void profile_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
     if (global_pf && global_pf->data) {
         show_slice_statistics(global_pf);
+    }
+}
+
+/* Popup data for distribution histogram */
+typedef struct {
+    Widget shell;
+    double *bin_counts;
+    double *bin_centers;
+    int n_bins;
+} DistributionPopupData;
+
+/* Callback to destroy distribution popup and free data */
+void close_distribution_popup_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    DistributionPopupData *popup_data = (DistributionPopupData *)client_data;
+
+    if (popup_data) {
+        if (popup_data->bin_counts) free(popup_data->bin_counts);
+        if (popup_data->bin_centers) free(popup_data->bin_centers);
+        XtDestroyWidget(popup_data->shell);
+        free(popup_data);
+    }
+}
+
+/* Draw histogram on a window */
+void draw_histogram(Display *dpy, Window win, GC plot_gc, double *bin_counts, double *bin_centers,
+                    int n_bins, int width, int height, double count_max,
+                    double bin_min, double bin_max, const char *title, const char *xlabel,
+                    double mean, double std, double kurtosis) {
+    /* Clear background */
+    XSetForeground(dpy, plot_gc, WhitePixel(dpy, screen));
+    XFillRectangle(dpy, win, plot_gc, 0, 0, width, height);
+
+    /* Draw border */
+    XSetForeground(dpy, plot_gc, BlackPixel(dpy, screen));
+    XDrawRectangle(dpy, win, plot_gc, 0, 0, width - 1, height - 1);
+
+    /* Draw title */
+    if (font) {
+        XSetFont(dpy, plot_gc, font->fid);
+        XDrawString(dpy, win, plot_gc, 10, 20, title, strlen(title));
+    }
+
+    /* Plot area */
+    int plot_left = 70;
+    int plot_right = width - 20;
+    int plot_top = 40;
+    int plot_bottom = height - 80;
+    int plot_width = plot_right - plot_left;
+    int plot_height = plot_bottom - plot_top;
+
+    if (plot_width <= 0 || plot_height <= 0 || n_bins < 1) return;
+
+    /* Draw axes */
+    XDrawLine(dpy, win, plot_gc, plot_left, plot_bottom, plot_right, plot_bottom);  /* x-axis */
+    XDrawLine(dpy, win, plot_gc, plot_left, plot_top, plot_left, plot_bottom);      /* y-axis */
+
+    /* Draw y-axis (count) ticks and labels */
+    char label[64];
+    int num_y_ticks = 4;
+    for (int i = 0; i <= num_y_ticks; i++) {
+        double y_val = count_max * i / num_y_ticks;
+        int y_pos = plot_bottom - (int)(plot_height * i / num_y_ticks);
+
+        XDrawLine(dpy, win, plot_gc, plot_left - 3, y_pos, plot_left, y_pos);
+        snprintf(label, sizeof(label), "%.0f", y_val);
+        int label_width = XTextWidth(font, label, strlen(label));
+        XDrawString(dpy, win, plot_gc, plot_left - label_width - 5, y_pos + 4, label, strlen(label));
+    }
+
+    /* Draw x-axis (value) ticks and labels */
+    int num_x_ticks = 5;
+    for (int i = 0; i <= num_x_ticks; i++) {
+        double x_val = bin_min + (bin_max - bin_min) * i / num_x_ticks;
+        int x_pos = plot_left + (int)(plot_width * i / num_x_ticks);
+
+        XDrawLine(dpy, win, plot_gc, x_pos, plot_bottom, x_pos, plot_bottom + 3);
+        snprintf(label, sizeof(label), "%.2e", x_val);
+        int label_width = XTextWidth(font, label, strlen(label));
+        XDrawString(dpy, win, plot_gc, x_pos - label_width / 2, plot_bottom + 14, label, strlen(label));
+    }
+
+    /* Draw x-axis label */
+    if (xlabel && xlabel[0]) {
+        int xlabel_width = XTextWidth(font, xlabel, strlen(xlabel));
+        XDrawString(dpy, win, plot_gc, plot_left + (plot_width - xlabel_width) / 2,
+                    plot_bottom + 30, xlabel, strlen(xlabel));
+    }
+
+    /* Draw histogram bars */
+    XSetForeground(dpy, plot_gc, 0x4444FF);  /* Blue */
+    double bin_width = (bin_max - bin_min) / n_bins;
+    int bar_width = plot_width / n_bins;
+    if (bar_width < 1) bar_width = 1;
+
+    for (int i = 0; i < n_bins; i++) {
+        int x = plot_left + (int)((bin_centers[i] - bin_min - bin_width/2) / (bin_max - bin_min) * plot_width);
+        int bar_height = (int)(bin_counts[i] / count_max * plot_height);
+        if (bar_height < 0) bar_height = 0;
+        int y = plot_bottom - bar_height;
+
+        XFillRectangle(dpy, win, plot_gc, x, y, bar_width - 1, bar_height);
+    }
+
+    /* Draw statistics text */
+    XSetForeground(dpy, plot_gc, BlackPixel(dpy, screen));
+    char stats[256];
+    snprintf(stats, sizeof(stats), "Mean: %.4e   Std: %.4e   Kurtosis: %.4f", mean, std, kurtosis);
+    XDrawString(dpy, win, plot_gc, plot_left, plot_bottom + 55, stats, strlen(stats));
+
+    XFlush(dpy);
+}
+
+/* Data structure for histogram expose handler */
+typedef struct {
+    double *bin_counts;
+    double *bin_centers;
+    int n_bins;
+    double count_max;
+    double bin_min, bin_max;
+    char title[128];
+    char xlabel[64];
+    double mean, std, kurtosis;
+} HistogramData;
+
+/* Expose event handler for histogram canvas */
+void histogram_expose_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch) {
+    if (event->type != Expose) return;
+
+    HistogramData *hist_data = (HistogramData *)client_data;
+    if (!hist_data || !hist_data->bin_counts) return;
+
+    Window win = XtWindow(w);
+    if (!win) return;
+
+    Dimension width, height;
+    XtVaGetValues(w, XtNwidth, &width, XtNheight, &height, NULL);
+
+    GC plot_gc = XCreateGC(display, win, 0, NULL);
+    draw_histogram(display, win, plot_gc, hist_data->bin_counts, hist_data->bin_centers,
+                   hist_data->n_bins, width, height, hist_data->count_max,
+                   hist_data->bin_min, hist_data->bin_max, hist_data->title, hist_data->xlabel,
+                   hist_data->mean, hist_data->std, hist_data->kurtosis);
+    XFreeGC(display, plot_gc);
+}
+
+/* Close callback that also frees histogram data */
+void close_histogram_popup_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    HistogramData *hist_data = (HistogramData *)client_data;
+
+    if (hist_data) {
+        if (hist_data->bin_counts) free(hist_data->bin_counts);
+        if (hist_data->bin_centers) free(hist_data->bin_centers);
+
+        /* Get the shell widget and destroy it */
+        Widget shell = XtParent(XtParent(w));
+        XtDestroyWidget(shell);
+
+        free(hist_data);
+    }
+}
+
+/* Show distribution histogram for current slice */
+void show_distribution(PlotfileData *pf) {
+    const char *axis_names[] = {"X", "Y", "Z"};
+    int axis = pf->slice_axis;
+    int slice_idx = pf->slice_idx;
+
+    /* Determine slice dimensions */
+    int slice_dim1, slice_dim2;
+    if (axis == 2) {
+        slice_dim1 = pf->grid_dims[0];
+        slice_dim2 = pf->grid_dims[1];
+    } else if (axis == 1) {
+        slice_dim1 = pf->grid_dims[0];
+        slice_dim2 = pf->grid_dims[2];
+    } else {
+        slice_dim1 = pf->grid_dims[1];
+        slice_dim2 = pf->grid_dims[2];
+    }
+    int slice_size = slice_dim1 * slice_dim2;
+
+    /* Extract slice data and calculate statistics */
+    double *slice_data = (double *)malloc(slice_size * sizeof(double));
+    double sum = 0.0, sum_sq = 0.0;
+    double data_min = 1e30, data_max = -1e30;
+
+    int k = 0;
+    for (int j = 0; j < slice_dim2; j++) {
+        for (int i = 0; i < slice_dim1; i++) {
+            int idx;
+            if (axis == 2) {
+                idx = slice_idx * pf->grid_dims[0] * pf->grid_dims[1] + j * pf->grid_dims[0] + i;
+            } else if (axis == 1) {
+                idx = j * pf->grid_dims[0] * pf->grid_dims[1] + slice_idx * pf->grid_dims[0] + i;
+            } else {
+                idx = j * pf->grid_dims[0] * pf->grid_dims[1] + i * pf->grid_dims[0] + slice_idx;
+            }
+            double val = pf->data[idx];
+            slice_data[k++] = val;
+            sum += val;
+            sum_sq += val * val;
+            if (val < data_min) data_min = val;
+            if (val > data_max) data_max = val;
+        }
+    }
+
+    /* Calculate mean and std */
+    double mean = sum / slice_size;
+    double variance = (sum_sq / slice_size) - (mean * mean);
+    double std = (variance > 0) ? sqrt(variance) : 0.0;
+
+    /* Calculate kurtosis (second pass) */
+    double sum_fourth = 0.0;
+    for (int i = 0; i < slice_size; i++) {
+        double diff = slice_data[i] - mean;
+        sum_fourth += diff * diff * diff * diff;
+    }
+    double kurtosis = 0.0;
+    if (std > 0) {
+        double std4 = std * std * std * std;
+        kurtosis = (sum_fourth / slice_size) / std4 - 3.0;
+    }
+
+    /* Determine number of bins using Sturges' rule */
+    int n_bins = (int)(1 + 3.322 * log10((double)slice_size));
+    if (n_bins < 10) n_bins = 10;
+    if (n_bins > 100) n_bins = 100;
+
+    /* Create histogram */
+    double *bin_counts = (double *)calloc(n_bins, sizeof(double));
+    double *bin_centers = (double *)malloc(n_bins * sizeof(double));
+    double bin_width = (data_max - data_min) / n_bins;
+    if (bin_width == 0) bin_width = 1.0;
+
+    for (int i = 0; i < n_bins; i++) {
+        bin_centers[i] = data_min + (i + 0.5) * bin_width;
+    }
+
+    /* Count values in each bin */
+    for (int i = 0; i < slice_size; i++) {
+        int bin = (int)((slice_data[i] - data_min) / bin_width);
+        if (bin < 0) bin = 0;
+        if (bin >= n_bins) bin = n_bins - 1;
+        bin_counts[bin]++;
+    }
+
+    /* Find max count for scaling */
+    double count_max = 0;
+    for (int i = 0; i < n_bins; i++) {
+        if (bin_counts[i] > count_max) count_max = bin_counts[i];
+    }
+    if (count_max == 0) count_max = 1;
+
+    free(slice_data);
+
+    /* Create histogram data structure */
+    HistogramData *hist_data = (HistogramData *)malloc(sizeof(HistogramData));
+    hist_data->bin_counts = bin_counts;
+    hist_data->bin_centers = bin_centers;
+    hist_data->n_bins = n_bins;
+    hist_data->count_max = count_max;
+    hist_data->bin_min = data_min;
+    hist_data->bin_max = data_max;
+    hist_data->mean = mean;
+    hist_data->std = std;
+    hist_data->kurtosis = kurtosis;
+    snprintf(hist_data->title, sizeof(hist_data->title), "%s Distribution at %s Layer %d",
+             pf->variables[pf->current_var], axis_names[axis], slice_idx + 1);
+    snprintf(hist_data->xlabel, sizeof(hist_data->xlabel), "%s", pf->variables[pf->current_var]);
+
+    /* Create popup shell */
+    Widget popup_shell = XtVaCreatePopupShell("Distribution",
+        transientShellWidgetClass, toplevel,
+        XtNwidth, 600,
+        XtNheight, 400,
+        NULL);
+
+    Widget popup_form = XtVaCreateManagedWidget("form",
+        formWidgetClass, popup_shell,
+        NULL);
+
+    /* Histogram canvas */
+    Widget hist_canvas = XtVaCreateManagedWidget("histogram",
+        simpleWidgetClass, popup_form,
+        XtNwidth, 580,
+        XtNheight, 320,
+        XtNborderWidth, 1,
+        NULL);
+
+    /* Add expose event handler */
+    XtAddEventHandler(hist_canvas, ExposureMask, False, histogram_expose_handler, hist_data);
+
+    /* Close button */
+    Widget close_button = XtVaCreateManagedWidget("Close",
+        commandWidgetClass, popup_form,
+        XtNfromVert, hist_canvas,
+        NULL);
+
+    XtAddCallback(close_button, XtNcallback, close_histogram_popup_callback, hist_data);
+
+    /* Show popup */
+    XtPopup(popup_shell, XtGrabNone);
+}
+
+/* Distribution button callback */
+void distribution_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    if (global_pf && global_pf->data) {
+        show_distribution(global_pf);
     }
 }
 
