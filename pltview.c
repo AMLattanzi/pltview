@@ -217,6 +217,20 @@ void profile_button_callback(Widget w, XtPointer client_data, XtPointer call_dat
 void show_slice_statistics(PlotfileData *pf);
 void distribution_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void show_distribution(PlotfileData *pf);
+void quiver_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void show_quiver_dialog(PlotfileData *pf);
+void quiver_apply_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void quiver_close_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void quiver_remove_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void quiver_density_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void quiver_scale_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void quiver_color_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void show_variable_selector(int for_x_component);
+void variable_select_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void variable_selector_close_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void render_quiver_overlay(PlotfileData *pf);
+void draw_arrow(Display *dpy, Drawable win, GC graphics_gc, int x1, int y1, int x2, int y2);
+void extract_slice_from_data(double *data, PlotfileData *pf, double *slice, int axis, int idx);
 void update_layer_label(PlotfileData *pf);
 void canvas_expose_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void canvas_motion_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch);
@@ -251,6 +265,35 @@ void sdm_settings_close_callback(Widget w, XtPointer client_data, XtPointer call
 
 /* Global pointer for callbacks */
 PlotfileData *global_pf = NULL;
+
+/* Quiver state and dialog widgets */
+typedef struct {
+    Widget shell;
+    Widget x_comp_text;
+    Widget y_comp_text;
+    Widget density_label;
+    Widget scale_label;
+    int x_comp_index;
+    int y_comp_index;
+    int enabled;
+    int density;     /* 1-5, controls arrow spacing */
+    double scale;    /* 0.5-3.0, controls arrow length */
+    int color;       /* 0=black, 1=white, 2=red, 3=blue */
+} QuiverData;
+
+QuiverData quiver_data = {NULL, NULL, NULL, NULL, NULL, -1, -1, 0, 3, 1.0, 0};
+
+/* Variable selection popup data */
+typedef struct {
+    Widget shell;
+    Widget viewport;
+    Widget list_widget;
+    int selecting_for_x;  /* 1 if selecting for X component, 0 for Y component */
+    Widget *var_buttons;  /* Array of buttons for each variable */
+    int n_vars;
+} VarSelectData;
+
+VarSelectData var_select_data = {NULL, NULL, NULL, 0, NULL, 0};
 
 /* Detect number of levels by scanning for Level_X directories */
 int detect_levels(PlotfileData *pf) {
@@ -1551,6 +1594,12 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     button = XtCreateManagedWidget("distribution", commandWidgetClass, tools_box, args, n);
     XtAddCallback(button, XtNcallback, distribution_button_callback, NULL);
 
+    /* Quiver button for vector field display */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "Quiver"); n++;
+    button = XtCreateManagedWidget("quiver", commandWidgetClass, tools_box, args, n);
+    XtAddCallback(button, XtNcallback, quiver_button_callback, NULL);
+
     /* COLUMN 3: Level buttons (only if multiple levels exist) */
     if (pf->n_levels > 1) {
         n = 0;
@@ -2407,6 +2456,11 @@ void render_slice(PlotfileData *pf) {
 
     /* Draw colorbar */
     draw_colorbar(display_vmin, display_vmax, pf->colormap);
+    
+    /* Draw quiver overlay if enabled */
+    if (quiver_data.enabled) {
+        render_quiver_overlay(pf);
+    }
     
     XFlush(display);
     
@@ -3628,6 +3682,599 @@ void show_distribution(PlotfileData *pf) {
 void distribution_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
     if (global_pf && global_pf->data) {
         show_distribution(global_pf);
+    }
+}
+
+/* Helper function to find variable index by name */
+int find_variable_index(PlotfileData *pf, const char *name) {
+    for (int i = 0; i < pf->n_vars; i++) {
+        if (strcmp(pf->variables[i], name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Get default component names based on current slice axis */
+void get_default_quiver_components(PlotfileData *pf, char *x_comp, char *y_comp) {
+    switch (pf->slice_axis) {
+        case 0:  /* X plane - show Y and Z velocity */
+            strcpy(x_comp, "y_velocity");
+            strcpy(y_comp, "z_velocity");
+            break;
+        case 1:  /* Y plane - show X and Z velocity */
+            strcpy(x_comp, "x_velocity");
+            strcpy(y_comp, "z_velocity");
+            break;
+        case 2:  /* Z plane - show X and Y velocity */
+        default:
+            strcpy(x_comp, "x_velocity");
+            strcpy(y_comp, "y_velocity");
+            break;
+    }
+}
+
+/* Quiver button callback */
+void quiver_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    if (global_pf && global_pf->data) {
+        /* Get default component names and enable quiver immediately */
+        char default_x[64], default_y[64];
+        get_default_quiver_components(global_pf, default_x, default_y);
+        
+        /* Find default indices */
+        quiver_data.x_comp_index = find_variable_index(global_pf, default_x);
+        quiver_data.y_comp_index = find_variable_index(global_pf, default_y);
+        
+        if (quiver_data.x_comp_index >= 0 && quiver_data.y_comp_index >= 0) {
+            quiver_data.enabled = 1;
+            /* Trigger immediate render with default settings */
+            render_slice(global_pf);
+        } else {
+            fprintf(stderr, "Warning: Could not find default velocity components\n");
+        }
+        
+        /* Show dialog for adjustments */
+        show_quiver_dialog(global_pf);
+    }
+}
+
+/* Show quiver component selection dialog */
+void show_quiver_dialog(PlotfileData *pf) {
+    Arg args[20];
+    int n;
+    Widget form, label, close_button;
+    Widget density_minus, density_plus, scale_minus, scale_plus;
+    Widget color_black, color_white, color_red, color_blue;
+    char density_text[32], scale_text[32];
+    
+    /* Don't create multiple dialogs */
+    if (quiver_data.shell) {
+        XtPopup(quiver_data.shell, XtGrabNone);
+        return;
+    }
+    
+    /* Get default component names */
+    char default_x[64], default_y[64];
+    get_default_quiver_components(pf, default_x, default_y);
+    
+    /* Find default indices */
+    quiver_data.x_comp_index = find_variable_index(pf, default_x);
+    quiver_data.y_comp_index = find_variable_index(pf, default_y);
+    
+    /* Create popup shell */
+    quiver_data.shell = XtVaCreatePopupShell("Quiver Options",
+        transientShellWidgetClass, toplevel,
+        XtNwidth, 400,
+        XtNheight, 350,
+        NULL);
+    
+    /* Main form */
+    n = 0;
+    form = XtCreateManagedWidget("form", formWidgetClass, quiver_data.shell, args, n);
+    
+    /* Title label */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "Quiver Options:"); n++;
+    XtSetArg(args[n], XtNborderWidth, 0); n++;
+    label = XtCreateManagedWidget("titleLabel", labelWidgetClass, form, args, n);
+    
+    /* X component label */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "X Component:"); n++;
+    XtSetArg(args[n], XtNfromVert, label); n++;
+    XtSetArg(args[n], XtNborderWidth, 0); n++;
+    Widget x_label = XtCreateManagedWidget("xLabel", labelWidgetClass, form, args, n);
+    
+    /* X component button */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, default_x); n++;
+    XtSetArg(args[n], XtNfromVert, x_label); n++;
+    XtSetArg(args[n], XtNwidth, 150); n++;
+    quiver_data.x_comp_text = XtCreateManagedWidget("xCompButton", commandWidgetClass, form, args, n);
+    XtAddCallback(quiver_data.x_comp_text, XtNcallback, (XtCallbackProc)show_variable_selector, (XtPointer)1);
+    
+    /* Y component label */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "Y Component:"); n++;
+    XtSetArg(args[n], XtNfromVert, quiver_data.x_comp_text); n++;
+    XtSetArg(args[n], XtNborderWidth, 0); n++;
+    Widget y_label = XtCreateManagedWidget("yLabel", labelWidgetClass, form, args, n);
+    
+    /* Y component button */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, default_y); n++;
+    XtSetArg(args[n], XtNfromVert, y_label); n++;
+    XtSetArg(args[n], XtNwidth, 150); n++;
+    quiver_data.y_comp_text = XtCreateManagedWidget("yCompButton", commandWidgetClass, form, args, n);
+    XtAddCallback(quiver_data.y_comp_text, XtNcallback, (XtCallbackProc)show_variable_selector, (XtPointer)0);
+    
+    /* Density control */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "Density:"); n++;
+    XtSetArg(args[n], XtNfromVert, quiver_data.y_comp_text); n++;
+    XtSetArg(args[n], XtNborderWidth, 0); n++;
+    Widget density_title = XtCreateManagedWidget("densityTitle", labelWidgetClass, form, args, n);
+    
+    /* Density minus button */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "-"); n++;
+    XtSetArg(args[n], XtNfromVert, density_title); n++;
+    XtSetArg(args[n], XtNwidth, 30); n++;
+    density_minus = XtCreateManagedWidget("densityMinus", commandWidgetClass, form, args, n);
+    XtAddCallback(density_minus, XtNcallback, quiver_density_callback, (XtPointer)-1);
+    
+    /* Density display */
+    snprintf(density_text, sizeof(density_text), "Density: %d", quiver_data.density);
+    n = 0;
+    XtSetArg(args[n], XtNlabel, density_text); n++;
+    XtSetArg(args[n], XtNfromVert, density_title); n++;
+    XtSetArg(args[n], XtNfromHoriz, density_minus); n++;
+    XtSetArg(args[n], XtNwidth, 100); n++;
+    XtSetArg(args[n], XtNborderWidth, 1); n++;
+    quiver_data.density_label = XtCreateManagedWidget("densityLabel", labelWidgetClass, form, args, n);
+    
+    /* Density plus button */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "+"); n++;
+    XtSetArg(args[n], XtNfromVert, density_title); n++;
+    XtSetArg(args[n], XtNfromHoriz, quiver_data.density_label); n++;
+    XtSetArg(args[n], XtNwidth, 30); n++;
+    density_plus = XtCreateManagedWidget("densityPlus", commandWidgetClass, form, args, n);
+    XtAddCallback(density_plus, XtNcallback, quiver_density_callback, (XtPointer)1);
+    
+    /* Scale control */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "Scale:"); n++;
+    XtSetArg(args[n], XtNfromVert, density_minus); n++;
+    XtSetArg(args[n], XtNborderWidth, 0); n++;
+    Widget scale_title = XtCreateManagedWidget("scaleTitle", labelWidgetClass, form, args, n);
+    
+    /* Scale minus button */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "-"); n++;
+    XtSetArg(args[n], XtNfromVert, scale_title); n++;
+    XtSetArg(args[n], XtNwidth, 30); n++;
+    scale_minus = XtCreateManagedWidget("scaleMinus", commandWidgetClass, form, args, n);
+    XtAddCallback(scale_minus, XtNcallback, quiver_scale_callback, (XtPointer)-1);
+    
+    /* Scale display */
+    snprintf(scale_text, sizeof(scale_text), "Scale: %.1f", quiver_data.scale);
+    n = 0;
+    XtSetArg(args[n], XtNlabel, scale_text); n++;
+    XtSetArg(args[n], XtNfromVert, scale_title); n++;
+    XtSetArg(args[n], XtNfromHoriz, scale_minus); n++;
+    XtSetArg(args[n], XtNwidth, 100); n++;
+    XtSetArg(args[n], XtNborderWidth, 1); n++;
+    quiver_data.scale_label = XtCreateManagedWidget("scaleLabel", labelWidgetClass, form, args, n);
+    
+    /* Scale plus button */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "+"); n++;
+    XtSetArg(args[n], XtNfromVert, scale_title); n++;
+    XtSetArg(args[n], XtNfromHoriz, quiver_data.scale_label); n++;
+    XtSetArg(args[n], XtNwidth, 30); n++;
+    scale_plus = XtCreateManagedWidget("scalePlus", commandWidgetClass, form, args, n);
+    XtAddCallback(scale_plus, XtNcallback, quiver_scale_callback, (XtPointer)1);
+    
+    /* Color control */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "Color:"); n++;
+    XtSetArg(args[n], XtNfromVert, scale_minus); n++;
+    XtSetArg(args[n], XtNborderWidth, 0); n++;
+    Widget color_title = XtCreateManagedWidget("colorTitle", labelWidgetClass, form, args, n);
+    
+    /* Color buttons */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "Black"); n++;
+    XtSetArg(args[n], XtNfromVert, color_title); n++;
+    XtSetArg(args[n], XtNwidth, 60); n++;
+    color_black = XtCreateManagedWidget("colorBlack", commandWidgetClass, form, args, n);
+    XtAddCallback(color_black, XtNcallback, quiver_color_callback, (XtPointer)0);
+    
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "White"); n++;
+    XtSetArg(args[n], XtNfromVert, color_title); n++;
+    XtSetArg(args[n], XtNfromHoriz, color_black); n++;
+    XtSetArg(args[n], XtNwidth, 60); n++;
+    color_white = XtCreateManagedWidget("colorWhite", commandWidgetClass, form, args, n);
+    XtAddCallback(color_white, XtNcallback, quiver_color_callback, (XtPointer)1);
+    
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "Red"); n++;
+    XtSetArg(args[n], XtNfromVert, color_title); n++;
+    XtSetArg(args[n], XtNfromHoriz, color_white); n++;
+    XtSetArg(args[n], XtNwidth, 60); n++;
+    color_red = XtCreateManagedWidget("colorRed", commandWidgetClass, form, args, n);
+    XtAddCallback(color_red, XtNcallback, quiver_color_callback, (XtPointer)2);
+    
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "Blue"); n++;
+    XtSetArg(args[n], XtNfromVert, color_title); n++;
+    XtSetArg(args[n], XtNfromHoriz, color_red); n++;
+    XtSetArg(args[n], XtNwidth, 60); n++;
+    color_blue = XtCreateManagedWidget("colorBlue", commandWidgetClass, form, args, n);
+    XtAddCallback(color_blue, XtNcallback, quiver_color_callback, (XtPointer)3);
+    
+    /* Remove button - removes quiver and closes dialog */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "Remove"); n++;
+    XtSetArg(args[n], XtNfromVert, color_black); n++;
+    close_button = XtCreateManagedWidget("removeButton", commandWidgetClass, form, args, n);
+    XtAddCallback(close_button, XtNcallback, quiver_remove_callback, NULL);
+    
+    /* Show dialog */
+    XtPopup(quiver_data.shell, XtGrabNone);
+}
+
+/* Apply quiver settings callback */
+void quiver_apply_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    /* Component indices are already set by variable selector */
+    if (quiver_data.x_comp_index >= 0 && quiver_data.y_comp_index >= 0) {
+        quiver_data.enabled = 1;
+        /* Trigger redraw to show quiver overlay */
+        render_slice(global_pf);
+    } else {
+        quiver_data.enabled = 0;
+        fprintf(stderr, "Warning: Invalid variable selection\n");
+    }
+}
+
+/* Close quiver dialog callback */
+void quiver_close_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    if (quiver_data.shell) {
+        XtDestroyWidget(quiver_data.shell);
+        quiver_data.shell = NULL;
+        quiver_data.x_comp_text = NULL;
+        quiver_data.y_comp_text = NULL;
+        quiver_data.density_label = NULL;
+        quiver_data.scale_label = NULL;
+    }
+}
+
+/* Remove quiver callback - disables quiver and closes dialog */
+void quiver_remove_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    /* Disable quiver */
+    quiver_data.enabled = 0;
+    
+    /* Trigger redraw to remove quiver overlay */
+    if (global_pf) {
+        render_slice(global_pf);
+    }
+    
+    /* Close dialog */
+    quiver_close_callback(w, client_data, call_data);
+}
+
+/* Density adjustment callback */
+void quiver_density_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    int direction = (int)(long)client_data;
+    char density_text[32];
+    
+    quiver_data.density += direction;
+    if (quiver_data.density < 1) quiver_data.density = 1;
+    if (quiver_data.density > 5) quiver_data.density = 5;
+    
+    snprintf(density_text, sizeof(density_text), "Density: %d", quiver_data.density);
+    XtVaSetValues(quiver_data.density_label, XtNlabel, density_text, NULL);
+    
+    /* Trigger redraw if quiver is enabled */
+    if (quiver_data.enabled && global_pf) {
+        render_slice(global_pf);
+    }
+}
+
+/* Scale adjustment callback */
+void quiver_scale_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    int direction = (int)(long)client_data;
+    char scale_text[32];
+    
+    quiver_data.scale += direction * 0.2;
+    if (quiver_data.scale < 0.2) quiver_data.scale = 0.2;
+    if (quiver_data.scale > 3.0) quiver_data.scale = 3.0;
+    
+    snprintf(scale_text, sizeof(scale_text), "Scale: %.1f", quiver_data.scale);
+    XtVaSetValues(quiver_data.scale_label, XtNlabel, scale_text, NULL);
+    
+    /* Trigger redraw if quiver is enabled */
+    if (quiver_data.enabled && global_pf) {
+        render_slice(global_pf);
+    }
+}
+
+/* Color selection callback */
+void quiver_color_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    quiver_data.color = (int)(long)client_data;
+    /* Trigger redraw if quiver is enabled */
+    if (quiver_data.enabled && global_pf) {
+        render_slice(global_pf);
+    }
+}
+
+/* Show variable selection popup */
+void show_variable_selector(int for_x_component) {
+    Arg args[20];
+    int n;
+    Widget form, label, close_button;
+    Widget scroll_widget, viewport;
+    char title[64];
+    
+    /* Don't create multiple selectors */
+    if (var_select_data.shell) {
+        XtDestroyWidget(var_select_data.shell);
+        if (var_select_data.var_buttons) {
+            free(var_select_data.var_buttons);
+            var_select_data.var_buttons = NULL;
+        }
+    }
+    
+    var_select_data.selecting_for_x = for_x_component;
+    var_select_data.n_vars = global_pf->n_vars;
+    
+    /* Create popup shell */
+    snprintf(title, sizeof(title), "Select %s Component", for_x_component ? "X" : "Y");
+    var_select_data.shell = XtVaCreatePopupShell(title,
+        transientShellWidgetClass, toplevel,
+        XtNwidth, 250,
+        XtNheight, 300,
+        NULL);
+    
+    /* Main form */
+    n = 0;
+    form = XtCreateManagedWidget("form", formWidgetClass, var_select_data.shell, args, n);
+    
+    /* Title label */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "Available Variables:"); n++;
+    XtSetArg(args[n], XtNborderWidth, 0); n++;
+    label = XtCreateManagedWidget("titleLabel", labelWidgetClass, form, args, n);
+    
+    /* Create box widget for variable buttons (simple scrollable list) */
+    n = 0;
+    XtSetArg(args[n], XtNfromVert, label); n++;
+    XtSetArg(args[n], XtNorientation, XtorientVertical); n++;
+    XtSetArg(args[n], XtNwidth, 230); n++;
+    XtSetArg(args[n], XtNheight, 200); n++;
+    Widget var_box = XtCreateManagedWidget("varBox", boxWidgetClass, form, args, n);
+    
+    /* Create buttons for each variable */
+    var_select_data.var_buttons = (Widget *)malloc(global_pf->n_vars * sizeof(Widget));
+    
+    for (int i = 0; i < global_pf->n_vars; i++) {
+        n = 0;
+        XtSetArg(args[n], XtNlabel, global_pf->variables[i]); n++;
+        XtSetArg(args[n], XtNwidth, 200); n++;
+        var_select_data.var_buttons[i] = XtCreateManagedWidget(global_pf->variables[i], 
+                                                              commandWidgetClass, var_box, args, n);
+        XtAddCallback(var_select_data.var_buttons[i], XtNcallback, 
+                     variable_select_callback, (XtPointer)(long)i);
+    }
+    
+    /* Close button */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "Close"); n++;
+    XtSetArg(args[n], XtNfromVert, var_box); n++;
+    close_button = XtCreateManagedWidget("closeButton", commandWidgetClass, form, args, n);
+    XtAddCallback(close_button, XtNcallback, variable_selector_close_callback, NULL);
+    
+    /* Show popup */
+    XtPopup(var_select_data.shell, XtGrabNone);
+}
+
+/* Variable selection callback */
+void variable_select_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    int var_index = (int)(long)client_data;
+    
+    /* Update the appropriate component */
+    if (var_select_data.selecting_for_x) {
+        quiver_data.x_comp_index = var_index;
+        /* Update button label */
+        XtVaSetValues(quiver_data.x_comp_text, XtNlabel, global_pf->variables[var_index], NULL);
+    } else {
+        quiver_data.y_comp_index = var_index;
+        /* Update button label */
+        XtVaSetValues(quiver_data.y_comp_text, XtNlabel, global_pf->variables[var_index], NULL);
+    }
+    
+    /* Trigger immediate redraw if quiver is enabled */
+    if (quiver_data.enabled && global_pf) {
+        render_slice(global_pf);
+    }
+    
+    /* Close the selector */
+    variable_selector_close_callback(w, NULL, NULL);
+}
+
+/* Close variable selector callback */
+void variable_selector_close_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    if (var_select_data.shell) {
+        XtDestroyWidget(var_select_data.shell);
+        var_select_data.shell = NULL;
+        if (var_select_data.var_buttons) {
+            free(var_select_data.var_buttons);
+            var_select_data.var_buttons = NULL;
+        }
+    }
+}
+
+/* Draw an arrow from (x1,y1) to (x2,y2) */
+void draw_arrow(Display *dpy, Drawable win, GC graphics_gc, int x1, int y1, int x2, int y2) {
+    /* Draw main line */
+    XDrawLine(dpy, win, graphics_gc, x1, y1, x2, y2);
+    
+    /* Calculate arrow head */
+    double angle = atan2(y2 - y1, x2 - x1);
+    double head_len = 4.0;  /* Arrow head length */
+    double head_angle = 0.5;  /* Arrow head angle */
+    
+    int head_x1 = x2 - (int)(head_len * cos(angle - head_angle));
+    int head_y1 = y2 - (int)(head_len * sin(angle - head_angle));
+    int head_x2 = x2 - (int)(head_len * cos(angle + head_angle));
+    int head_y2 = y2 - (int)(head_len * sin(angle + head_angle));
+    
+    /* Draw arrow head */
+    XDrawLine(dpy, win, graphics_gc, x2, y2, head_x1, head_y1);
+    XDrawLine(dpy, win, graphics_gc, x2, y2, head_x2, head_y2);
+}
+
+/* Render quiver overlay */
+void render_quiver_overlay(PlotfileData *pf) {
+    if (!quiver_data.enabled || quiver_data.x_comp_index < 0 || quiver_data.y_comp_index < 0) {
+        return;
+    }
+    
+    /* Get current slice dimensions */
+    int width, height;
+    if (pf->slice_axis == 2) {
+        width = pf->grid_dims[0];
+        height = pf->grid_dims[1];
+    } else if (pf->slice_axis == 1) {
+        width = pf->grid_dims[0];
+        height = pf->grid_dims[2];
+    } else {
+        width = pf->grid_dims[1];
+        height = pf->grid_dims[2];
+    }
+    
+    /* Read component data */
+    double *x_comp_data = (double *)malloc(pf->grid_dims[0] * pf->grid_dims[1] * pf->grid_dims[2] * sizeof(double));
+    double *y_comp_data = (double *)malloc(pf->grid_dims[0] * pf->grid_dims[1] * pf->grid_dims[2] * sizeof(double));
+    
+    /* Save current variable and read component data */
+    int saved_var = pf->current_var;
+    
+    pf->current_var = quiver_data.x_comp_index;
+    read_variable_data(pf, quiver_data.x_comp_index);
+    memcpy(x_comp_data, pf->data, pf->grid_dims[0] * pf->grid_dims[1] * pf->grid_dims[2] * sizeof(double));
+    
+    pf->current_var = quiver_data.y_comp_index;
+    read_variable_data(pf, quiver_data.y_comp_index);
+    memcpy(y_comp_data, pf->data, pf->grid_dims[0] * pf->grid_dims[1] * pf->grid_dims[2] * sizeof(double));
+    
+    /* Restore original variable */
+    pf->current_var = saved_var;
+    read_variable_data(pf, saved_var);
+    
+    /* Extract slices for both components */
+    double *x_slice = (double *)malloc(width * height * sizeof(double));
+    double *y_slice = (double *)malloc(width * height * sizeof(double));
+    
+    extract_slice_from_data(x_comp_data, pf, x_slice, pf->slice_axis, pf->slice_idx);
+    extract_slice_from_data(y_comp_data, pf, y_slice, pf->slice_axis, pf->slice_idx);
+    
+    /* Find max magnitude for scaling */
+    double max_mag = 0.0;
+    for (int i = 0; i < width * height; i++) {
+        double mag = sqrt(x_slice[i] * x_slice[i] + y_slice[i] * y_slice[i]);
+        if (mag > max_mag) max_mag = mag;
+    }
+    
+    if (max_mag == 0.0) {
+        free(x_comp_data);
+        free(y_comp_data);
+        free(x_slice);
+        free(y_slice);
+        return;
+    }
+    
+    /* Set up drawing parameters */
+    unsigned long arrow_color;
+    switch (quiver_data.color) {
+        case 1: arrow_color = WhitePixel(display, screen); break;  /* White */
+        case 2: arrow_color = 0xFF0000; break;  /* Red */
+        case 3: arrow_color = 0x0000FF; break;  /* Blue */
+        default: arrow_color = BlackPixel(display, screen); break;  /* Black */
+    }
+    XSetForeground(display, gc, arrow_color);
+    XSetLineAttributes(display, gc, 1, LineSolid, CapRound, JoinRound);
+    
+    /* Draw arrows with user-controlled density */
+    /* Map density 1-5 to skip values with much wider range */
+    int skip;
+    switch (quiver_data.density) {
+        case 1: skip = (width > 100 || height > 100) ? 20 : 16; break;  /* Very sparse */
+        case 2: skip = (width > 100 || height > 100) ? 12 : 10; break;  /* Sparse */
+        case 3: skip = (width > 100 || height > 100) ? 8 : 6; break;    /* Medium */
+        case 4: skip = (width > 100 || height > 100) ? 5 : 4; break;    /* Dense */
+        case 5: skip = (width > 100 || height > 100) ? 3 : 2; break;    /* Very dense */
+        default: skip = 8; break;
+    }
+    
+    double scale = 15.0 * quiver_data.scale;  /* User-controlled arrow scale */
+    
+    for (int j = skip/2; j < height; j += skip) {
+        for (int i = skip/2; i < width; i += skip) {
+            int idx = j * width + i;
+            double u = x_slice[idx] / max_mag;
+            double v = y_slice[idx] / max_mag;
+            
+            if (fabs(u) < 1e-10 && fabs(v) < 1e-10) continue;
+            
+            /* Convert data coordinates to screen coordinates */
+            int screen_x = render_offset_x + (int)((double)i * render_width / width);
+            int screen_y = render_offset_y + (int)((double)j * render_height / height);
+            
+            int arrow_dx = (int)(u * scale);
+            int arrow_dy = (int)(-v * scale);  /* Flip Y to match screen coordinates */
+            
+            draw_arrow(display, canvas, gc, screen_x, screen_y, 
+                      screen_x + arrow_dx, screen_y + arrow_dy);
+        }
+    }
+    
+    /* Cleanup */
+    free(x_comp_data);
+    free(y_comp_data);
+    free(x_slice);
+    free(y_slice);
+}
+
+/* Helper function to extract slice from arbitrary data array */
+void extract_slice_from_data(double *data, PlotfileData *pf, double *slice, int axis, int idx) {
+    int width, height;
+    if (axis == 2) {
+        width = pf->grid_dims[0];
+        height = pf->grid_dims[1];
+        for (int j = 0; j < height; j++) {
+            for (int i = 0; i < width; i++) {
+                slice[j * width + i] = data[idx * width * height + j * width + i];
+            }
+        }
+    } else if (axis == 1) {
+        width = pf->grid_dims[0];
+        height = pf->grid_dims[2];
+        for (int k = 0; k < height; k++) {
+            for (int i = 0; i < width; i++) {
+                slice[k * width + i] = data[k * pf->grid_dims[0] * pf->grid_dims[1] + idx * pf->grid_dims[0] + i];
+            }
+        }
+    } else {
+        width = pf->grid_dims[1];
+        height = pf->grid_dims[2];
+        for (int k = 0; k < height; k++) {
+            for (int j = 0; j < width; j++) {
+                slice[k * width + j] = data[k * pf->grid_dims[0] * pf->grid_dims[1] + j * pf->grid_dims[0] + idx];
+            }
+        }
     }
 }
 
