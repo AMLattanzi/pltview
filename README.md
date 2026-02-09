@@ -1,4 +1,4 @@
-# pltview
+# pltview: A simple viewer for AMReX plotfiles
 
 A lightweight X11 viewer for AMReX plotfiles, inspired by ncview and built with the assistance of Claude Code and Copilot.
 
@@ -6,7 +6,7 @@ A lightweight X11 viewer for AMReX plotfiles, inspired by ncview and built with 
 
 ## Features
 
-- **Direct X11 rendering** with minimal dependencies (10-100x faster than Python alternatives)
+- **Direct X11 rendering** with minimal dependencies
 - **Multi-level AMR support**: Automatically detects and visualizes multiple refinement levels
 - **Multi-timestep support**: Navigate through time series data with `<`/`>` buttons or Left/Right arrow keys
 - **Interactive 3D slicing**: View 2D slices of 3D data along X, Y, Z axes with wrap-around navigation
