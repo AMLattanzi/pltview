@@ -56,6 +56,8 @@ typedef struct {
     int colormap;  /* 0=viridis, 1=jet, 2=turbo, 3=plasma */
     int current_level;  /* Current AMR level */
     int n_levels;       /* Number of AMR levels */
+    double prob_lo[3];  /* Domain lower bounds */
+    double prob_hi[3];  /* Domain upper bounds */
 } PlotfileData;
 
 /* Colormap */
@@ -200,7 +202,8 @@ RGB cool_colormap(double t);
 RGB gray_colormap(double t);
 RGB magma_colormap(double t);
 RGB get_colormap_rgb(double t, int cmap_type);
-void draw_colorbar(double vmin, double vmax, int cmap_type);
+const char *get_variable_unit(const char *varname);
+void draw_colorbar(double vmin, double vmax, int cmap_type, const char *varname);
 void cmap_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void colormap_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void colorbar_expose_callback(Widget w, XtPointer client_data, XtPointer call_data);
@@ -225,7 +228,7 @@ void quiver_remove_callback(Widget w, XtPointer client_data, XtPointer call_data
 void quiver_density_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void quiver_scale_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void quiver_color_callback(Widget w, XtPointer client_data, XtPointer call_data);
-void show_variable_selector(int for_x_component);
+void show_variable_selector(Widget w, XtPointer client_data, XtPointer call_data);
 void variable_select_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void variable_selector_close_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void render_quiver_overlay(PlotfileData *pf);
@@ -755,11 +758,21 @@ int read_header(PlotfileData *pf) {
     /* Number of levels - read from Header but verify by scanning directories */
     fgets(line, MAX_LINE, fp);
     int header_levels = atoi(line);
-    
-    /* Skip to domain box (lines: low, high, refinement) */
-    fgets(line, MAX_LINE, fp);  /* low */
-    fgets(line, MAX_LINE, fp);  /* high */
-    fgets(line, MAX_LINE, fp);  /* refinement */
+
+    /* Read prob_lo (domain lower bounds) */
+    fgets(line, MAX_LINE, fp);
+    pf->prob_lo[0] = pf->prob_lo[1] = pf->prob_lo[2] = 0.0;
+    if (pf->ndim == 3) sscanf(line, "%lf %lf %lf", &pf->prob_lo[0], &pf->prob_lo[1], &pf->prob_lo[2]);
+    else if (pf->ndim == 2) sscanf(line, "%lf %lf", &pf->prob_lo[0], &pf->prob_lo[1]);
+
+    /* Read prob_hi (domain upper bounds) */
+    fgets(line, MAX_LINE, fp);
+    pf->prob_hi[0] = pf->prob_hi[1] = pf->prob_hi[2] = 0.0;
+    if (pf->ndim == 3) sscanf(line, "%lf %lf %lf", &pf->prob_hi[0], &pf->prob_hi[1], &pf->prob_hi[2]);
+    else if (pf->ndim == 2) sscanf(line, "%lf %lf", &pf->prob_hi[0], &pf->prob_hi[1]);
+
+    /* Skip refinement ratios */
+    fgets(line, MAX_LINE, fp);
     
     /* Domain box */
     fgets(line, MAX_LINE, fp);
@@ -795,6 +808,9 @@ int read_header(PlotfileData *pf) {
     if (pf->n_vars > 5) printf("...");
     printf(")\n");
     printf("Grid: %d x %d x %d\n", pf->grid_dims[0], pf->grid_dims[1], pf->grid_dims[2]);
+    printf("Domain: [%.3g, %.3g] x [%.3g, %.3g] x [%.3g, %.3g]\n",
+           pf->prob_lo[0], pf->prob_hi[0], pf->prob_lo[1], pf->prob_hi[1],
+           pf->prob_lo[2], pf->prob_hi[2]);
     printf("Time: %.3f\n", pf->time);
     printf("Levels: %d (Header says %d)\n", pf->n_levels, header_levels);
     
@@ -1372,6 +1388,67 @@ RGB get_colormap_rgb(double t, int cmap_type) {
     }
 }
 
+/* Get unit string for a variable based on common naming conventions */
+const char *get_variable_unit(const char *varname) {
+    if (!varname) return "";
+
+    /* Velocity components */
+    if (strstr(varname, "velocity") || strstr(varname, "vel_") ||
+        strcmp(varname, "u") == 0 || strcmp(varname, "v") == 0 ||
+        strcmp(varname, "w") == 0) {
+        return "m/s";
+    }
+    /* Temperature and potential temperature */
+    if (strstr(varname, "temp") || strstr(varname, "theta") ||
+        strcmp(varname, "T") == 0) {
+        return "K";
+    }
+    /* Pressure */
+    if (strstr(varname, "pressure") || strstr(varname, "pres") ||
+        strcmp(varname, "p") == 0 || strcmp(varname, "P") == 0) {
+        return "Pa";
+    }
+    /* Density */
+    if (strcmp(varname, "density") == 0 || strcmp(varname, "rho") == 0) {
+        return "kg/m^3";
+    }
+    /* Density times theta */
+    if (strstr(varname, "rhotheta")) {
+        return "kg K/m^3";
+    }
+    /* Mixing ratios */
+    if (strncmp(varname, "q", 1) == 0 && strlen(varname) <= 6) {
+        return "kg/kg";
+    }
+    /* Relative humidity */
+    if (strstr(varname, "humidity") || strstr(varname, "rh") ||
+        strcmp(varname, "RH") == 0) {
+        return "";  /* fraction or % depending on simulation */
+    }
+    /* Number density */
+    if (strstr(varname, "number_density")) {
+        return "1/m^3";
+    }
+    /* Mass density (for particles) */
+    if (strstr(varname, "mass_density")) {
+        return "kg/m^3";
+    }
+    /* Radius (droplets) */
+    if (strstr(varname, "radius")) {
+        return "m";
+    }
+    /* Vorticity */
+    if (strstr(varname, "vort") || strstr(varname, "omega")) {
+        return "1/s";
+    }
+    /* TKE */
+    if (strstr(varname, "tke") || strstr(varname, "TKE")) {
+        return "m^2/s^2";
+    }
+
+    return "";  /* Unknown - no unit */
+}
+
 /* Apply colormap to data */
 void apply_colormap(double *data, int width, int height, 
                    unsigned long *pixels, double vmin, double vmax, int cmap_type) {
@@ -1389,49 +1466,75 @@ void apply_colormap(double *data, int width, int height,
     }
 }
 
-/* Draw colorbar */
-void draw_colorbar(double vmin, double vmax, int cmap_type) {
+/* Draw colorbar with variable name and units */
+void draw_colorbar(double vmin, double vmax, int cmap_type, const char *varname) {
     int height = 256, width = 30;
-    int margin = 10;   /* Margin from top and bottom for tick labels */
-    
+    int top_margin = 50;   /* Extra space at top for variable name */
+    int bottom_margin = 10;
+
     /* Clear colorbar with white background */
     XSetForeground(display, colorbar_gc, WhitePixel(display, screen));
     XFillRectangle(display, colorbar, colorbar_gc, 0, 0, 100, canvas_height);
-    
+
+    /* Draw variable name at top */
+    XSetForeground(display, text_gc, BlackPixel(display, screen));
+    if (varname && strlen(varname) > 0) {
+        /* Truncate long variable names */
+        char short_name[16];
+        if (strlen(varname) > 12) {
+            strncpy(short_name, varname, 11);
+            short_name[11] = '\0';
+            strcat(short_name, "..");
+        } else {
+            strncpy(short_name, varname, 15);
+            short_name[15] = '\0';
+        }
+        XDrawString(display, colorbar, text_gc, 2, 15, short_name, strlen(short_name));
+
+        /* Draw unit below variable name */
+        const char *unit = get_variable_unit(varname);
+        if (unit && strlen(unit) > 0) {
+            char unit_str[20];
+            snprintf(unit_str, sizeof(unit_str), "[%s]", unit);
+            XDrawString(display, colorbar, text_gc, 2, 30, unit_str, strlen(unit_str));
+        }
+    }
+
     /* Draw colorbar as solid rectangles within margins */
     for (int i = 0; i < height; i++) {
         double t = (double)(height - 1 - i) / (height - 1);
         RGB color = get_colormap_rgb(t, cmap_type);
         unsigned long pixel = (color.r << 16) | (color.g << 8) | color.b;
-        
+
         XSetForeground(display, colorbar_gc, pixel);
-        int y = margin + (i * (canvas_height - 2 * margin)) / height;
-        int h = margin + ((i + 1) * (canvas_height - 2 * margin)) / height - y;
+        int y = top_margin + (i * (canvas_height - top_margin - bottom_margin)) / height;
+        int h = top_margin + ((i + 1) * (canvas_height - top_margin - bottom_margin)) / height - y;
         if (h < 1) h = 1;
         XFillRectangle(display, colorbar, colorbar_gc, 0, y, width, h);
     }
-    
+
     /* Draw tick marks and labels */
     char text[32];
     XSetForeground(display, text_gc, BlackPixel(display, screen));
-    
+
     int n_ticks = 11;  /* 11 ticks gives 10 intervals */
-    
+
     for (int i = 0; i < n_ticks; i++) {
         double fraction = (double)i / (n_ticks - 1);
         double value = vmin + fraction * (vmax - vmin);
-        
+
         /* Map to drawable area with margins */
-        int y = margin + (canvas_height - 2 * margin) - (int)(fraction * (canvas_height - 2 * margin));
-        
+        int y = top_margin + (canvas_height - top_margin - bottom_margin) -
+                (int)(fraction * (canvas_height - top_margin - bottom_margin));
+
         /* Draw tick mark */
         XDrawLine(display, colorbar, text_gc, width, y, width + 5, y);
-        
+
         /* Draw label with vertical centering adjustment */
         snprintf(text, sizeof(text), "%.2e", value);
         XDrawString(display, colorbar, text_gc, width + 8, y + 4, text, strlen(text));
     }
-    
+
     XFlush(display);
 }
 
@@ -2255,7 +2358,8 @@ void cmap_button_callback(Widget w, XtPointer client_data, XtPointer call_data) 
     if (global_pf) {
         global_pf->colormap = cmap;
         render_slice(global_pf);
-        draw_colorbar(current_vmin, current_vmax, cmap);
+        draw_colorbar(current_vmin, current_vmax, cmap,
+                      global_pf->variables[global_pf->current_var]);
     }
 }
 
@@ -2265,7 +2369,8 @@ void cmap_select_callback(Widget w, XtPointer client_data, XtPointer call_data) 
     if (global_pf) {
         global_pf->colormap = cmap;
         render_slice(global_pf);
-        draw_colorbar(current_vmin, current_vmax, cmap);
+        draw_colorbar(current_vmin, current_vmax, cmap,
+                      global_pf->variables[global_pf->current_var]);
     }
 
     /* Close the dialog */
@@ -2339,7 +2444,8 @@ void canvas_expose_callback(Widget w, XtPointer client_data, XtPointer call_data
 /* Colorbar expose callback */
 void colorbar_expose_callback(Widget w, XtPointer client_data, XtPointer call_data) {
     if (global_pf) {
-        draw_colorbar(current_vmin, current_vmax, global_pf->colormap);
+        draw_colorbar(current_vmin, current_vmax, global_pf->colormap,
+                      global_pf->variables[global_pf->current_var]);
     }
 }
 void render_slice(PlotfileData *pf) {
@@ -2348,29 +2454,48 @@ void render_slice(PlotfileData *pf) {
     double vmin = 1e30, vmax = -1e30;
     int i;
     char stats_text[128];
-    
-    /* Determine slice dimensions */
-    if (pf->slice_axis == 2) {
+
+    /* Axis margin sizes */
+    int left_margin = 60;    /* Space for Y-axis labels */
+    int bottom_margin = 40;  /* Space for X-axis labels */
+    int top_margin = 10;     /* Small top margin */
+    int right_margin = 10;   /* Small right margin */
+
+    /* Determine slice dimensions and physical coordinates */
+    int x_axis, y_axis;  /* Which physical dimensions map to screen x,y */
+    if (pf->slice_axis == 2) {       /* Z-slice: X horizontal, Y vertical */
         width = pf->grid_dims[0];
         height = pf->grid_dims[1];
-    } else if (pf->slice_axis == 1) {
+        x_axis = 0;  /* X */
+        y_axis = 1;  /* Y */
+    } else if (pf->slice_axis == 1) { /* Y-slice: X horizontal, Z vertical */
         width = pf->grid_dims[0];
         height = pf->grid_dims[2];
-    } else {
+        x_axis = 0;  /* X */
+        y_axis = 2;  /* Z */
+    } else {                          /* X-slice: Y horizontal, Z vertical */
         width = pf->grid_dims[1];
         height = pf->grid_dims[2];
+        x_axis = 1;  /* Y */
+        y_axis = 2;  /* Z */
     }
-    
+
+    /* Physical coordinate ranges for axes */
+    double phys_xmin = pf->prob_lo[x_axis];
+    double phys_xmax = pf->prob_hi[x_axis];
+    double phys_ymin = pf->prob_lo[y_axis];
+    double phys_ymax = pf->prob_hi[y_axis];
+
     slice = (double *)malloc(width * height * sizeof(double));
     extract_slice(pf, slice, pf->slice_axis, pf->slice_idx);
-    
+
     /* Store current slice for mouse interaction */
     if (current_slice_data) free(current_slice_data);
     current_slice_data = (double *)malloc(width * height * sizeof(double));
     memcpy(current_slice_data, slice, width * height * sizeof(double));
     slice_width = width;
     slice_height = height;
-    
+
     /* Find data min/max */
     for (i = 0; i < width * height; i++) {
         if (slice[i] < vmin) vmin = slice[i];
@@ -2393,43 +2518,47 @@ void render_slice(PlotfileData *pf) {
 
     /* Apply colormap */
     apply_colormap(slice, width, height, pixel_data, display_vmin, display_vmax, pf->colormap);
-    
+
     /* Clear canvas with white background */
     XSetForeground(display, gc, WhitePixel(display, screen));
     XFillRectangle(display, canvas, gc, 0, 0, canvas_width, canvas_height);
-    
-    /* Calculate scaling to maintain aspect ratio */
+
+    /* Available area for data (excluding margins) */
+    int avail_width = canvas_width - left_margin - right_margin;
+    int avail_height = canvas_height - top_margin - bottom_margin;
+
+    /* Calculate scaling to maintain aspect ratio within available area */
     double data_aspect = (double)width / height;
-    double canvas_aspect = (double)canvas_width / canvas_height;
-    
+    double avail_aspect = (double)avail_width / avail_height;
+
     int offset_x, offset_y;
-    if (data_aspect > canvas_aspect) {
+    if (data_aspect > avail_aspect) {
         /* Width-limited */
-        render_width = canvas_width;
-        render_height = (int)(canvas_width / data_aspect);
-        offset_x = 0;
-        offset_y = (canvas_height - render_height) / 2;
+        render_width = avail_width;
+        render_height = (int)(avail_width / data_aspect);
+        offset_x = left_margin;
+        offset_y = top_margin + (avail_height - render_height) / 2;
     } else {
         /* Height-limited */
-        render_width = (int)(canvas_height * data_aspect);
-        render_height = canvas_height;
-        offset_x = (canvas_width - render_width) / 2;
-        offset_y = 0;
+        render_width = (int)(avail_height * data_aspect);
+        render_height = avail_height;
+        offset_x = left_margin + (avail_width - render_width) / 2;
+        offset_y = top_margin;
     }
-    
+
     /* Store rendering parameters for mouse interaction */
     render_offset_x = offset_x;
     render_offset_y = offset_y;
-    
+
     /* Draw pixels as filled rectangles with correct aspect ratio */
     double pixel_width = (double)render_width / width;
     double pixel_height = (double)render_height / height;
-    
+
     for (int j = 0; j < height; j++) {
         for (int i = 0; i < width; i++) {
             unsigned long pixel = pixel_data[j * width + i];
             XSetForeground(display, gc, pixel);
-            
+
             int x = offset_x + (int)(i * pixel_width);
             /* Flip y-axis: higher j (higher y in data) should be at top of screen */
             int flipped_j = height - 1 - j;
@@ -2438,11 +2567,81 @@ void render_slice(PlotfileData *pf) {
             int h = (int)((flipped_j + 1) * pixel_height) - (int)(flipped_j * pixel_height);
             if (w < 1) w = 1;
             if (h < 1) h = 1;
-            
+
             XFillRectangle(display, canvas, gc, x, y, w, h);
         }
     }
-    
+
+    /* Draw axis frame (border around data) */
+    XSetForeground(display, text_gc, BlackPixel(display, screen));
+    XDrawRectangle(display, canvas, text_gc, offset_x, offset_y, render_width, render_height);
+
+    /* Draw X-axis ticks and labels */
+    int n_xticks = 5;
+    char label[32];
+    for (i = 0; i <= n_xticks; i++) {
+        double frac = (double)i / n_xticks;
+        int tick_x = offset_x + (int)(frac * render_width);
+        double phys_val = phys_xmin + frac * (phys_xmax - phys_xmin);
+
+        /* Draw tick mark */
+        XDrawLine(display, canvas, text_gc, tick_x, offset_y + render_height,
+                  tick_x, offset_y + render_height + 5);
+
+        /* Draw label */
+        snprintf(label, sizeof(label), "%.3g", phys_val);
+        int label_width = XTextWidth(font, label, strlen(label));
+        XDrawString(display, canvas, text_gc, tick_x - label_width / 2,
+                    offset_y + render_height + 18, label, strlen(label));
+    }
+
+    /* Draw Y-axis ticks and labels */
+    int n_yticks = 5;
+    for (i = 0; i <= n_yticks; i++) {
+        double frac = (double)i / n_yticks;
+        int tick_y = offset_y + render_height - (int)(frac * render_height);
+        double phys_val = phys_ymin + frac * (phys_ymax - phys_ymin);
+
+        /* Draw tick mark */
+        XDrawLine(display, canvas, text_gc, offset_x - 5, tick_y, offset_x, tick_y);
+
+        /* Draw label */
+        snprintf(label, sizeof(label), "%.3g", phys_val);
+        int label_width = XTextWidth(font, label, strlen(label));
+        XDrawString(display, canvas, text_gc, offset_x - label_width - 8,
+                    tick_y + 4, label, strlen(label));
+    }
+
+    /* Draw axis labels with units */
+    const char *axis_names[] = {"X", "Y", "Z"};
+    char x_label[32], y_label[32];
+
+    /* Auto-detect units based on domain size */
+    double max_extent = fmax(fmax(pf->prob_hi[0] - pf->prob_lo[0],
+                                   pf->prob_hi[1] - pf->prob_lo[1]),
+                              pf->prob_hi[2] - pf->prob_lo[2]);
+    const char *unit_str;
+    if (max_extent > 1000.0) {
+        unit_str = "(km)";  /* Large domains likely in km */
+    } else if (max_extent > 1.0) {
+        unit_str = "(m)";   /* Most atmospheric simulations use meters */
+    } else {
+        unit_str = "";      /* Normalized/dimensionless */
+    }
+
+    snprintf(x_label, sizeof(x_label), "%s %s", axis_names[x_axis], unit_str);
+    snprintf(y_label, sizeof(y_label), "%s %s", axis_names[y_axis], unit_str);
+
+    /* X-axis label (centered below ticks) */
+    int xlabel_width = XTextWidth(font, x_label, strlen(x_label));
+    XDrawString(display, canvas, text_gc,
+                offset_x + render_width / 2 - xlabel_width / 2,
+                offset_y + render_height + 35, x_label, strlen(x_label));
+
+    /* Y-axis label (rotated text is hard in X11, so just draw at left) */
+    XDrawString(display, canvas, text_gc, 5,
+                offset_y + render_height / 2 + 4, y_label, strlen(y_label));
+
     /* Draw text overlay - show display range (custom if set) */
     if (use_custom_range) {
         snprintf(stats_text, sizeof(stats_text), "range: %.3e to %.3e (custom)", display_vmin, display_vmax);
@@ -2451,17 +2650,18 @@ void render_slice(PlotfileData *pf) {
     }
     XSetForeground(display, text_gc, BlackPixel(display, screen));
     XSetBackground(display, text_gc, WhitePixel(display, screen));
-    XDrawImageString(display, canvas, text_gc, 10, canvas_height - 10,
+    XDrawImageString(display, canvas, text_gc, left_margin, canvas_height - 5,
                     stats_text, strlen(stats_text));
 
     /* Draw colorbar */
-    draw_colorbar(display_vmin, display_vmax, pf->colormap);
-    
+    draw_colorbar(display_vmin, display_vmax, pf->colormap,
+                  pf->variables[pf->current_var]);
+
     /* Draw quiver overlay if enabled */
     if (quiver_data.enabled) {
         render_quiver_overlay(pf);
     }
-    
+
     XFlush(display);
     
     printf("Rendered: %s, slice %d/%d (%.3e to %.3e)\n", 
@@ -3791,7 +3991,7 @@ void show_quiver_dialog(PlotfileData *pf) {
     XtSetArg(args[n], XtNfromVert, x_label); n++;
     XtSetArg(args[n], XtNwidth, 150); n++;
     quiver_data.x_comp_text = XtCreateManagedWidget("xCompButton", commandWidgetClass, form, args, n);
-    XtAddCallback(quiver_data.x_comp_text, XtNcallback, (XtCallbackProc)show_variable_selector, (XtPointer)1);
+    XtAddCallback(quiver_data.x_comp_text, XtNcallback, show_variable_selector, (XtPointer)1);
     
     /* Y component label */
     n = 0;
@@ -3806,7 +4006,7 @@ void show_quiver_dialog(PlotfileData *pf) {
     XtSetArg(args[n], XtNfromVert, y_label); n++;
     XtSetArg(args[n], XtNwidth, 150); n++;
     quiver_data.y_comp_text = XtCreateManagedWidget("yCompButton", commandWidgetClass, form, args, n);
-    XtAddCallback(quiver_data.y_comp_text, XtNcallback, (XtCallbackProc)show_variable_selector, (XtPointer)0);
+    XtAddCallback(quiver_data.y_comp_text, XtNcallback, show_variable_selector, (XtPointer)0);
     
     /* Density control */
     n = 0;
@@ -4011,13 +4211,13 @@ void quiver_color_callback(Widget w, XtPointer client_data, XtPointer call_data)
 }
 
 /* Show variable selection popup */
-void show_variable_selector(int for_x_component) {
+void show_variable_selector(Widget w, XtPointer client_data, XtPointer call_data) {
+    int for_x_component = (int)(long)client_data;
     Arg args[20];
     int n;
     Widget form, label, close_button;
-    Widget scroll_widget, viewport;
     char title[64];
-    
+
     /* Don't create multiple selectors */
     if (var_select_data.shell) {
         XtDestroyWidget(var_select_data.shell);
@@ -4026,10 +4226,10 @@ void show_variable_selector(int for_x_component) {
             var_select_data.var_buttons = NULL;
         }
     }
-    
+
     var_select_data.selecting_for_x = for_x_component;
     var_select_data.n_vars = global_pf->n_vars;
-    
+
     /* Create popup shell */
     snprintf(title, sizeof(title), "Select %s Component", for_x_component ? "X" : "Y");
     var_select_data.shell = XtVaCreatePopupShell(title,
@@ -5473,7 +5673,8 @@ int main(int argc, char **argv) {
                     initial_focus_set = 1;
                 }
             } else if (event.xexpose.window == colorbar && global_pf) {
-                draw_colorbar(current_vmin, current_vmax, global_pf->colormap);
+                draw_colorbar(current_vmin, current_vmax, global_pf->colormap,
+                              global_pf->variables[global_pf->current_var]);
             }
         }
         /* Handle keyboard events */
