@@ -5019,6 +5019,7 @@ void sdm_switch_timestep(ParticleData *pd, int new_timestep) {
 
     render_sdm_histogram(pd);
     update_sdm_info_label(pd, timestep_paths[current_timestep]);
+    update_time_label();
 }
 
 /* SDM time navigation button callback */
