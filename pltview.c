@@ -2616,18 +2616,8 @@ void render_slice(PlotfileData *pf) {
     const char *axis_names[] = {"X", "Y", "Z"};
     char x_label[32], y_label[32];
 
-    /* Auto-detect units based on domain size */
-    double max_extent = fmax(fmax(pf->prob_hi[0] - pf->prob_lo[0],
-                                   pf->prob_hi[1] - pf->prob_lo[1]),
-                              pf->prob_hi[2] - pf->prob_lo[2]);
-    const char *unit_str;
-    if (max_extent > 1000.0) {
-        unit_str = "(km)";  /* Large domains likely in km */
-    } else if (max_extent > 1.0) {
-        unit_str = "(m)";   /* Most atmospheric simulations use meters */
-    } else {
-        unit_str = "";      /* Normalized/dimensionless */
-    }
+    /* Unit label - coordinates are in raw plotfile units (typically meters) */
+    const char *unit_str = "(m)";
 
     snprintf(x_label, sizeof(x_label), "%s %s", axis_names[x_axis], unit_str);
     snprintf(y_label, sizeof(y_label), "%s %s", axis_names[y_axis], unit_str);
