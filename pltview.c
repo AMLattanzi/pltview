@@ -32,6 +32,7 @@
 #define MAX_PATH 512
 #define MAX_LINE 1024
 #define MAX_TIMESTEPS 1024
+#define MAX_LEVELS 10
 
 /* Data structures */
 typedef struct {
@@ -40,6 +41,17 @@ typedef struct {
     char filename[64];
 } Box;
 
+/* Per-level data storage for multi-level overlay rendering */
+typedef struct {
+    int grid_dims[3];       /* Grid dimensions for this level */
+    int level_lo[3];        /* Lower index bounds in level's coordinates */
+    int level_hi[3];        /* Upper index bounds in level's coordinates */
+    Box boxes[MAX_BOXES];   /* Box definitions for this level */
+    int n_boxes;            /* Number of boxes at this level */
+    double *data;           /* Variable data for this level */
+    int loaded;             /* Flag: 1 if data is loaded, 0 otherwise */
+} LevelData;
+
 typedef struct {
     char plotfile_dir[MAX_PATH];
     char variables[MAX_VARS][64];
@@ -47,6 +59,8 @@ typedef struct {
     int ndim;
     double time;
     int grid_dims[3];
+    int level_lo[3];    /* Current level's lower index bounds */
+    int level_hi[3];    /* Current level's upper index bounds */
     Box boxes[MAX_BOXES];
     int n_boxes;
     double *data;  /* Current variable data */
@@ -58,6 +72,10 @@ typedef struct {
     int n_levels;       /* Number of AMR levels */
     double prob_lo[3];  /* Domain lower bounds */
     double prob_hi[3];  /* Domain upper bounds */
+    /* Multi-level overlay data */
+    LevelData levels[MAX_LEVELS];  /* Per-level data for overlay rendering */
+    int ref_ratio[MAX_LEVELS];     /* Refinement ratio between levels */
+    int overlay_mode;              /* 0=single level, 1=overlay all levels */
 } PlotfileData;
 
 /* Colormap */
@@ -153,8 +171,10 @@ double custom_vmax = 1.0;
 /* Multi-timestep support */
 char *timestep_paths[MAX_TIMESTEPS];  /* Array of plotfile paths */
 int timestep_numbers[MAX_TIMESTEPS];   /* Numerical values for sorting */
+int timestep_levels[MAX_TIMESTEPS];    /* Number of levels at each timestep */
 int n_timesteps = 0;                   /* Number of timesteps found */
 int current_timestep = 0;              /* Current timestep index */
+int max_levels_all_timesteps = 1;      /* Max levels across all timesteps */
 Widget time_label = NULL;              /* Time step display label */
 
 /* Data structure for histogram expose handler (forward declaration for SDM) */
@@ -184,13 +204,22 @@ int sdm_dialog_active = 0;
 Widget sdm_active_text_widget = NULL;
 int sdm_active_field = 0;  /* 0=cutoff, 1=binwidth */
 Widget sdm_dialog_shell = NULL;
+Widget overlay_button = NULL;  /* Overlay toggle button */
 
 /* Function prototypes */
 int detect_levels(PlotfileData *pf);
+int detect_levels_for_path(const char *plotfile_dir);
+void show_level_warning(int level);
 int read_header(PlotfileData *pf);
 int read_cell_h(PlotfileData *pf);
 int read_variable_data(PlotfileData *pf, int var_idx);
 void extract_slice(PlotfileData *pf, double *slice, int axis, int idx);
+void extract_slice_level(LevelData *ld, double *slice, int axis, int idx);
+/* Multi-level overlay functions */
+int read_cell_h_level(PlotfileData *pf, int level);
+int read_variable_data_level(PlotfileData *pf, int var_idx, int level);
+int load_all_levels(PlotfileData *pf, int var_idx);
+void free_all_levels(PlotfileData *pf);
 void apply_colormap(double *data, int width, int height, 
                    unsigned long *pixels, double vmin, double vmax, int cmap_type);
 RGB viridis_colormap(double t);
@@ -213,6 +242,7 @@ void update_info_label(PlotfileData *pf);
 void var_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void axis_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void level_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void overlay_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void nav_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void jump_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void range_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
@@ -302,7 +332,7 @@ VarSelectData var_select_data = {NULL, NULL, NULL, 0, NULL, 0};
 int detect_levels(PlotfileData *pf) {
     char path[MAX_PATH];
     int level = 0;
-    
+
     /* Count how many Level_X directories exist */
     while (level < 100) {
         snprintf(path, MAX_PATH, "%s/Level_%d", pf->plotfile_dir, level);
@@ -311,8 +341,67 @@ int detect_levels(PlotfileData *pf) {
         closedir(dir);
         level++;
     }
-    
+
     return level > 0 ? level : 1;
+}
+
+/* Detect number of levels for a given plotfile path */
+int detect_levels_for_path(const char *plotfile_dir) {
+    char path[MAX_PATH];
+    int level = 0;
+
+    /* Count how many Level_X directories exist */
+    while (level < 100) {
+        snprintf(path, MAX_PATH, "%s/Level_%d", plotfile_dir, level);
+        DIR *dir = opendir(path);
+        if (!dir) break;
+        closedir(dir);
+        level++;
+    }
+
+    return level > 0 ? level : 1;
+}
+
+/* Show warning popup when level is not available at current timestep */
+/* Callback to close warning popup */
+void warning_ok_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    Widget shell = (Widget)client_data;
+    if (shell) {
+        XtDestroyWidget(shell);
+    }
+}
+
+void show_level_warning(int level) {
+    Arg args[10];
+    int n;
+    char msg[128];
+
+    snprintf(msg, sizeof(msg), "Level %d not available at this timestep", level);
+
+    /* Create popup shell */
+    n = 0;
+    XtSetArg(args[n], XtNtitle, "Warning"); n++;
+    Widget warning_shell = XtCreatePopupShell("levelWarning", transientShellWidgetClass, toplevel, args, n);
+
+    /* Create form container */
+    Widget form = XtVaCreateManagedWidget("form", formWidgetClass, warning_shell, NULL);
+
+    /* Create warning label */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, msg); n++;
+    XtSetArg(args[n], XtNborderWidth, 0); n++;
+    Widget warning_label = XtCreateManagedWidget("warningLabel", labelWidgetClass, form, args, n);
+
+    /* Create OK button */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "OK"); n++;
+    XtSetArg(args[n], XtNfromVert, warning_label); n++;
+    Widget ok_button = XtCreateManagedWidget("okButton", commandWidgetClass, form, args, n);
+
+    /* OK button callback - destroy the popup */
+    XtAddCallback(ok_button, XtNcallback, warning_ok_callback, (XtPointer)warning_shell);
+
+    XtPopup(warning_shell, XtGrabExclusive);
 }
 
 /* Comparison function for sorting timesteps */
@@ -328,6 +417,7 @@ int scan_timesteps(const char *base_dir, const char *prefix) {
     struct dirent *entry;
     char check_path[MAX_PATH];
     int indices[MAX_TIMESTEPS];
+    int temp_levels[MAX_TIMESTEPS];
     int prefix_len = strlen(prefix);
 
     dir = opendir(base_dir);
@@ -337,6 +427,7 @@ int scan_timesteps(const char *base_dir, const char *prefix) {
     }
 
     n_timesteps = 0;
+    max_levels_all_timesteps = 1;
 
     while ((entry = readdir(dir)) != NULL && n_timesteps < MAX_TIMESTEPS) {
         /* Check if entry starts with the specified prefix */
@@ -366,6 +457,14 @@ int scan_timesteps(const char *base_dir, const char *prefix) {
                 timestep_paths[n_timesteps] = (char *)malloc(MAX_PATH);
                 snprintf(timestep_paths[n_timesteps], MAX_PATH, "%s/%s", base_dir, entry->d_name);
                 timestep_numbers[n_timesteps] = num;
+
+                /* Detect levels for this timestep */
+                int levels = detect_levels_for_path(timestep_paths[n_timesteps]);
+                temp_levels[n_timesteps] = levels;
+                if (levels > max_levels_all_timesteps) {
+                    max_levels_all_timesteps = levels;
+                }
+
                 indices[n_timesteps] = n_timesteps;
                 n_timesteps++;
             }
@@ -384,18 +483,21 @@ int scan_timesteps(const char *base_dir, const char *prefix) {
     /* Reorder arrays based on sorted indices */
     char *temp_paths[MAX_TIMESTEPS];
     int temp_numbers[MAX_TIMESTEPS];
+    int sorted_levels[MAX_TIMESTEPS];
 
     for (int i = 0; i < n_timesteps; i++) {
         temp_paths[i] = timestep_paths[indices[i]];
         temp_numbers[i] = timestep_numbers[indices[i]];
+        sorted_levels[i] = temp_levels[indices[i]];
     }
 
     for (int i = 0; i < n_timesteps; i++) {
         timestep_paths[i] = temp_paths[i];
         timestep_numbers[i] = temp_numbers[i];
+        timestep_levels[i] = sorted_levels[i];
     }
 
-    printf("Found %d timesteps\n", n_timesteps);
+    printf("Found %d timesteps, max levels across all: %d\n", n_timesteps, max_levels_all_timesteps);
     return n_timesteps;
 }
 
@@ -481,8 +583,23 @@ void switch_timestep(PlotfileData *pf, int new_timestep) {
     /* Update plotfile directory */
     strncpy(pf->plotfile_dir, timestep_paths[current_timestep], MAX_PATH - 1);
 
+    /* Always free old overlay data before reading new timestep */
+    free_all_levels(pf);
+
+    /* Save overlay_mode before read_header (which resets it) */
+    int saved_overlay_mode = pf->overlay_mode;
+
     /* Re-read header for new timestep */
     read_header(pf);
+
+    /* Restore overlay_mode */
+    pf->overlay_mode = saved_overlay_mode;
+
+    /* Clamp current_level if new timestep has fewer levels */
+    if (pf->current_level >= pf->n_levels) {
+        pf->current_level = pf->n_levels - 1;
+        if (pf->current_level < 0) pf->current_level = 0;
+    }
 
     /* Reset boxes and re-read cell data */
     pf->n_boxes = 0;
@@ -496,6 +613,14 @@ void switch_timestep(PlotfileData *pf, int new_timestep) {
 
     /* Re-read variable data */
     read_variable_data(pf, pf->current_var);
+
+    /* If overlay mode is on, reload all levels for new timestep */
+    /* Don't change overlay_mode or button label - just reload data if needed */
+    printf("switch_timestep: overlay_mode=%d, n_levels=%d\n", pf->overlay_mode, pf->n_levels);
+    if (pf->overlay_mode && pf->n_levels > 1) {
+        printf("switch_timestep: Reloading overlay levels...\n");
+        load_all_levels(pf, pf->current_var);
+    }
 
     /* Update UI */
     update_time_label();
@@ -771,8 +896,15 @@ int read_header(PlotfileData *pf) {
     if (pf->ndim == 3) sscanf(line, "%lf %lf %lf", &pf->prob_hi[0], &pf->prob_hi[1], &pf->prob_hi[2]);
     else if (pf->ndim == 2) sscanf(line, "%lf %lf", &pf->prob_hi[0], &pf->prob_hi[1]);
 
-    /* Skip refinement ratios */
+    /* Parse refinement ratios - format: "r1 r2 ..." or "(r1,r2,r3) ..." */
     fgets(line, MAX_LINE, fp);
+    pf->ref_ratio[0] = 1;  /* Level 0 has no refinement */
+    int ref = atoi(line);  /* First number is ref ratio for level 0->1 */
+    for (i = 1; i < MAX_LEVELS; i++) {
+        pf->ref_ratio[i] = (ref > 0) ? ref : 2;  /* Default to 2 if not parsed */
+    }
+    /* Initialize overlay mode to off */
+    pf->overlay_mode = 0;
     
     /* Domain box */
     fgets(line, MAX_LINE, fp);
@@ -888,15 +1020,23 @@ int read_cell_h(PlotfileData *pf) {
     }
     
     fclose(fp);
-    
-    /* Update grid dimensions based on level domain */
+
+    /* Update grid dimensions and level bounds */
     for (i = 0; i < pf->ndim; i++) {
+        pf->level_lo[i] = level_lo[i];
+        pf->level_hi[i] = level_hi[i];
         pf->grid_dims[i] = level_hi[i] - level_lo[i] + 1;
     }
-    
-    printf("Level %d: Found %d boxes, Grid: %d x %d x %d\n", 
-           pf->current_level, pf->n_boxes, 
-           pf->grid_dims[0], pf->grid_dims[1], pf->grid_dims[2]);
+    /* Initialize any remaining dimensions to 0 for 2D cases */
+    for (i = pf->ndim; i < 3; i++) {
+        pf->level_lo[i] = 0;
+        pf->level_hi[i] = 0;
+    }
+
+    printf("Level %d: Found %d boxes, Grid: %d x %d x %d (lo: %d,%d,%d)\n",
+           pf->current_level, pf->n_boxes,
+           pf->grid_dims[0], pf->grid_dims[1], pf->grid_dims[2],
+           pf->level_lo[0], pf->level_lo[1], pf->level_lo[2]);
     return 0;
 }
 
@@ -938,15 +1078,16 @@ int read_variable_data(PlotfileData *pf, int var_idx) {
         
         /* Insert into global array (Fortran order -> C order) */
         /* Fortran order: X varies fastest */
+        /* Use relative indices by subtracting level_lo to handle non-zero level origins */
         size_t idx = 0;
         for (k = 0; k < box_dims[2]; k++) {
             for (j = 0; j < box_dims[1]; j++) {
                 for (i = 0; i < box_dims[0]; i++) {
-                    int gx = box->lo[0] + i;
-                    int gy = box->lo[1] + j;
-                    int gz = box->lo[2] + k;
+                    int gx = box->lo[0] + i - pf->level_lo[0];
+                    int gy = box->lo[1] + j - pf->level_lo[1];
+                    int gz = box->lo[2] + k - pf->level_lo[2];
                     /* Global array: data[z][y][x] */
-                    size_t gidx = gz * pf->grid_dims[1] * pf->grid_dims[0] + 
+                    size_t gidx = gz * pf->grid_dims[1] * pf->grid_dims[0] +
                                   gy * pf->grid_dims[0] + gx;
                     pf->data[gidx] = box_data[idx++];
                 }
@@ -958,6 +1099,211 @@ int read_variable_data(PlotfileData *pf, int var_idx) {
     
     printf("Loaded variable: %s\n", pf->variables[var_idx]);
     return 0;
+}
+
+/* ========== Multi-Level Overlay Functions ========== */
+
+/* Read Cell_H for a specific level into LevelData */
+int read_cell_h_level(PlotfileData *pf, int level) {
+    char path[MAX_PATH];
+    char line[MAX_LINE];
+    FILE *fp;
+    int i;
+    LevelData *ld = &pf->levels[level];
+
+    snprintf(path, MAX_PATH, "%s/Level_%d/Cell_H", pf->plotfile_dir, level);
+    fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "Error: Cannot open %s\n", path);
+        return -1;
+    }
+
+    /* Reset level data */
+    int level_lo[3] = {0, 0, 0};
+    int level_hi[3] = {0, 0, 0};
+    int found_domain = 0;
+    ld->n_boxes = 0;
+
+    /* Parse box definitions and FabOnDisk entries */
+    int box_count = 0;
+    while (fgets(line, MAX_LINE, fp)) {
+        if (strncmp(line, "((", 2) == 0) {
+            /* Parse box: ((lo_x,lo_y,lo_z) (hi_x,hi_y,hi_z) ...) */
+            char *p = line + 2;
+            int lo[3], hi[3];
+            for (i = 0; i < pf->ndim; i++) {
+                while (*p && !isdigit(*p) && *p != '-') p++;
+                lo[i] = atoi(p);
+                ld->boxes[box_count].lo[i] = lo[i];
+                while (*p && (isdigit(*p) || *p == '-')) p++;
+            }
+            for (i = 0; i < pf->ndim; i++) {
+                while (*p && !isdigit(*p) && *p != '-') p++;
+                hi[i] = atoi(p);
+                ld->boxes[box_count].hi[i] = hi[i];
+                while (*p && (isdigit(*p) || *p == '-')) p++;
+            }
+
+            /* Track overall domain bounds */
+            if (!found_domain) {
+                for (i = 0; i < pf->ndim; i++) {
+                    level_lo[i] = lo[i];
+                    level_hi[i] = hi[i];
+                }
+                found_domain = 1;
+            } else {
+                for (i = 0; i < pf->ndim; i++) {
+                    if (lo[i] < level_lo[i]) level_lo[i] = lo[i];
+                    if (hi[i] > level_hi[i]) level_hi[i] = hi[i];
+                }
+            }
+            box_count++;
+        } else if (strncmp(line, "FabOnDisk:", 10) == 0) {
+            /* Parse FabOnDisk: Cell_D_XXXXX */
+            char *p = strchr(line, ':');
+            if (p) {
+                p++;
+                while (*p == ' ') p++;
+                char *end = strchr(p, ' ');
+                if (end) *end = '\0';
+                end = strchr(p, '\n');
+                if (end) *end = '\0';
+                strncpy(ld->boxes[ld->n_boxes].filename, p, 63);
+                ld->n_boxes++;
+            }
+        }
+    }
+
+    fclose(fp);
+
+    /* Store level bounds and grid dimensions */
+    for (i = 0; i < pf->ndim; i++) {
+        ld->level_lo[i] = level_lo[i];
+        ld->level_hi[i] = level_hi[i];
+        ld->grid_dims[i] = level_hi[i] - level_lo[i] + 1;
+    }
+    for (i = pf->ndim; i < 3; i++) {
+        ld->level_lo[i] = 0;
+        ld->level_hi[i] = 0;
+        ld->grid_dims[i] = 1;
+    }
+
+    printf("Level %d overlay: Found %d boxes, Grid: %d x %d x %d (lo: %d,%d,%d)\n",
+           level, ld->n_boxes,
+           ld->grid_dims[0], ld->grid_dims[1], ld->grid_dims[2],
+           ld->level_lo[0], ld->level_lo[1], ld->level_lo[2]);
+    return 0;
+}
+
+/* Read variable data for a specific level into LevelData */
+int read_variable_data_level(PlotfileData *pf, int var_idx, int level) {
+    char path[MAX_PATH];
+    FILE *fp;
+    int box_idx, i, j, k;
+    LevelData *ld = &pf->levels[level];
+
+    size_t total_size = (size_t)ld->grid_dims[0] * ld->grid_dims[1] * ld->grid_dims[2];
+
+    /* Allocate data array */
+    if (ld->data) free(ld->data);
+    ld->data = (double *)calloc(total_size, sizeof(double));
+    if (!ld->data) {
+        fprintf(stderr, "Error: Cannot allocate memory for level %d\n", level);
+        return -1;
+    }
+
+    /* Read each box */
+    for (box_idx = 0; box_idx < ld->n_boxes; box_idx++) {
+        Box *box = &ld->boxes[box_idx];
+        int box_dims[3];
+        for (i = 0; i < 3; i++) {
+            box_dims[i] = box->hi[i] - box->lo[i] + 1;
+        }
+        size_t box_size = box_dims[0] * box_dims[1] * box_dims[2];
+
+        snprintf(path, MAX_PATH, "%s/Level_%d/%s", pf->plotfile_dir, level, box->filename);
+        fp = fopen(path, "rb");
+        if (!fp) continue;
+
+        /* Skip FAB header */
+        int c;
+        while ((c = fgetc(fp)) != EOF && c != '\n');
+
+        /* Skip to variable data */
+        fseek(fp, var_idx * box_size * sizeof(double), SEEK_CUR);
+
+        /* Read box data */
+        double *box_data = (double *)malloc(box_size * sizeof(double));
+        fread(box_data, sizeof(double), box_size, fp);
+        fclose(fp);
+
+        /* Insert into level array using relative indices */
+        size_t idx = 0;
+        for (k = 0; k < box_dims[2]; k++) {
+            for (j = 0; j < box_dims[1]; j++) {
+                for (i = 0; i < box_dims[0]; i++) {
+                    int gx = box->lo[0] + i - ld->level_lo[0];
+                    int gy = box->lo[1] + j - ld->level_lo[1];
+                    int gz = box->lo[2] + k - ld->level_lo[2];
+                    size_t gidx = gz * ld->grid_dims[1] * ld->grid_dims[0] +
+                                  gy * ld->grid_dims[0] + gx;
+                    ld->data[gidx] = box_data[idx++];
+                }
+            }
+        }
+
+        free(box_data);
+    }
+
+    ld->loaded = 1;
+    printf("Loaded level %d: %s\n", level, pf->variables[var_idx]);
+    return 0;
+}
+
+/* Load all levels for overlay rendering */
+int load_all_levels(PlotfileData *pf, int var_idx) {
+    int level;
+    int loaded_count = 0;
+
+    printf("load_all_levels: Loading %d levels for var %d\n", pf->n_levels, var_idx);
+
+    for (level = 0; level < pf->n_levels && level < MAX_LEVELS; level++) {
+        /* Always read Cell_H for this level to ensure fresh data */
+        if (read_cell_h_level(pf, level) < 0) {
+            fprintf(stderr, "Warning: Cannot read Cell_H for level %d\n", level);
+            continue;
+        }
+
+        /* Read variable data for this level */
+        if (read_variable_data_level(pf, var_idx, level) < 0) {
+            fprintf(stderr, "Warning: Cannot load variable for level %d\n", level);
+            continue;
+        }
+
+        loaded_count++;
+    }
+
+    printf("Loaded %d of %d levels for overlay\n", loaded_count, pf->n_levels);
+    return 0;
+}
+
+/* Free all level data */
+void free_all_levels(PlotfileData *pf) {
+    int level, i;
+    for (level = 0; level < MAX_LEVELS; level++) {
+        if (pf->levels[level].data) {
+            free(pf->levels[level].data);
+            pf->levels[level].data = NULL;
+        }
+        pf->levels[level].loaded = 0;
+        pf->levels[level].n_boxes = 0;
+        /* Clear all fields to prevent stale data issues */
+        for (i = 0; i < 3; i++) {
+            pf->levels[level].grid_dims[i] = 0;
+            pf->levels[level].level_lo[i] = 0;
+            pf->levels[level].level_hi[i] = 0;
+        }
+    }
 }
 
 /* ========== SDM (Super Droplet Moisture) Functions ========== */
@@ -1191,7 +1537,7 @@ void extract_slice(PlotfileData *pf, double *slice, int axis, int idx) {
     int nx = pf->grid_dims[0];
     int ny = pf->grid_dims[1];
     int nz = pf->grid_dims[2];
-    
+
     if (axis == 2) {  /* Z slice */
         for (j = 0; j < ny; j++) {
             for (i = 0; i < nx; i++) {
@@ -1208,6 +1554,34 @@ void extract_slice(PlotfileData *pf, double *slice, int axis, int idx) {
         for (k = 0; k < nz; k++) {
             for (j = 0; j < ny; j++) {
                 slice[k * ny + j] = pf->data[k * ny * nx + j * nx + idx];
+            }
+        }
+    }
+}
+
+/* Extract slice from a specific level's data */
+void extract_slice_level(LevelData *ld, double *slice, int axis, int idx) {
+    int i, j, k;
+    int nx = ld->grid_dims[0];
+    int ny = ld->grid_dims[1];
+    int nz = ld->grid_dims[2];
+
+    if (axis == 2) {  /* Z slice */
+        for (j = 0; j < ny; j++) {
+            for (i = 0; i < nx; i++) {
+                slice[j * nx + i] = ld->data[idx * ny * nx + j * nx + i];
+            }
+        }
+    } else if (axis == 1) {  /* Y slice */
+        for (k = 0; k < nz; k++) {
+            for (i = 0; i < nx; i++) {
+                slice[k * nx + i] = ld->data[k * ny * nx + idx * nx + i];
+            }
+        }
+    } else {  /* X slice */
+        for (k = 0; k < nz; k++) {
+            for (j = 0; j < ny; j++) {
+                slice[k * ny + j] = ld->data[k * ny * nx + j * nx + idx];
             }
         }
     }
@@ -1703,8 +2077,10 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     button = XtCreateManagedWidget("quiver", commandWidgetClass, tools_box, args, n);
     XtAddCallback(button, XtNcallback, quiver_button_callback, NULL);
 
-    /* COLUMN 3: Level buttons (only if multiple levels exist) */
-    if (pf->n_levels > 1) {
+    /* COLUMN 3: Level buttons (show if any timestep has multiple levels) */
+    /* Use max_levels_all_timesteps for multi-timestep mode, pf->n_levels for single plotfile */
+    int total_levels = (n_timesteps > 1) ? max_levels_all_timesteps : pf->n_levels;
+    if (total_levels > 1) {
         n = 0;
         XtSetArg(args[n], XtNfromVert, canvas_widget); n++;
         XtSetArg(args[n], XtNfromHoriz, axis_box); n++;
@@ -1714,14 +2090,22 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
         XtSetArg(args[n], XtNleft, XawChainLeft); n++;
         Widget level_box = XtCreateManagedWidget("levelBox", boxWidgetClass, form, args, n);
 
-        /* Add level buttons (limit to 10 levels) */
-        int max_levels = pf->n_levels < 10 ? pf->n_levels : 10;
+        /* Add level buttons for all levels across all timesteps (limit to 10) */
+        int max_levels = total_levels < 10 ? total_levels : 10;
         for (i = 0; i < max_levels; i++) {
             n = 0;
             snprintf(label_text, sizeof(label_text), "Level %d", i);
             XtSetArg(args[n], XtNlabel, label_text); n++;
             button = XtCreateManagedWidget(label_text, commandWidgetClass, level_box, args, n);
             XtAddCallback(button, XtNcallback, level_button_callback, (XtPointer)(long)i);
+        }
+
+        /* Add overlay toggle button if more than one level possible */
+        if (total_levels > 1) {
+            n = 0;
+            XtSetArg(args[n], XtNlabel, "Overlay: OFF"); n++;
+            overlay_button = XtCreateManagedWidget("overlay", commandWidgetClass, level_box, args, n);
+            XtAddCallback(overlay_button, XtNcallback, overlay_button_callback, NULL);
         }
     }
 
@@ -1876,6 +2260,12 @@ void var_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
     if (global_pf && var < global_pf->n_vars) {
         global_pf->current_var = var;
         read_variable_data(global_pf, var);
+
+        /* If overlay mode is on, reload all overlay levels with the new variable */
+        if (global_pf->overlay_mode) {
+            load_all_levels(global_pf, var);
+        }
+
         update_info_label(global_pf);
         render_slice(global_pf);
     }
@@ -1897,22 +2287,63 @@ void axis_button_callback(Widget w, XtPointer client_data, XtPointer call_data) 
 /* Level button callback */
 void level_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
     int level = (int)(long)client_data;
-    if (global_pf && level < global_pf->n_levels) {
-        global_pf->current_level = level;
-        
-        /* Reload data for new level */
-        global_pf->n_boxes = 0;
-        read_cell_h(global_pf);
-        read_variable_data(global_pf, global_pf->current_var);
-        
-        /* Clamp slice_idx if new level has fewer layers */
-        int max_idx = global_pf->grid_dims[global_pf->slice_axis] - 1;
-        if (global_pf->slice_idx > max_idx) {
-            global_pf->slice_idx = max_idx;
+    if (!global_pf) return;
+
+    /* Check if the requested level is available at the current timestep */
+    if (level >= global_pf->n_levels) {
+        show_level_warning(level);
+        return;
+    }
+
+    global_pf->current_level = level;
+
+    /* Reload data for new level */
+    global_pf->n_boxes = 0;
+    read_cell_h(global_pf);
+    read_variable_data(global_pf, global_pf->current_var);
+
+    /* Clamp slice_idx if new level has fewer layers */
+    int max_idx = global_pf->grid_dims[global_pf->slice_axis] - 1;
+    if (global_pf->slice_idx > max_idx) {
+        global_pf->slice_idx = max_idx;
+    }
+
+    update_layer_label(global_pf);
+    update_info_label(global_pf);
+    render_slice(global_pf);
+}
+
+/* Overlay toggle button callback */
+void overlay_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    if (global_pf) {
+        global_pf->overlay_mode = !global_pf->overlay_mode;
+
+        if (global_pf->overlay_mode) {
+            /* Load all levels data for overlay */
+            printf("Enabling overlay mode - loading all levels...\n");
+            if (global_pf->n_levels > 1) {
+                load_all_levels(global_pf, global_pf->current_var);
+            }
+
+            /* Update button label */
+            Arg args[1];
+            if (global_pf->n_levels > 1) {
+                XtSetArg(args[0], XtNlabel, "Overlay: ON");
+            } else {
+                XtSetArg(args[0], XtNlabel, "Overlay: ON (no L1)");
+            }
+            XtSetValues(overlay_button, args, 1);
+        } else {
+            /* Disable overlay mode */
+            printf("Disabling overlay mode\n");
+            free_all_levels(global_pf);
+
+            /* Update button label */
+            Arg args[1];
+            XtSetArg(args[0], XtNlabel, "Overlay: OFF");
+            XtSetValues(overlay_button, args, 1);
         }
-        
-        update_layer_label(global_pf);
-        update_info_label(global_pf);
+
         render_slice(global_pf);
     }
 }
@@ -2502,6 +2933,75 @@ void render_slice(PlotfileData *pf) {
         if (slice[i] > vmax) vmax = slice[i];
     }
 
+    /* When overlay mode is on, include all overlay levels in min/max for consistent colorbar */
+    if (pf->overlay_mode && pf->n_levels > 1) {
+        LevelData *ld0 = &pf->levels[0];
+        int level0_dims[3];
+        double dx0_overlay[3];
+        for (i = 0; i < 3; i++) {
+            level0_dims[i] = (ld0->loaded && ld0->grid_dims[i] > 0) ? ld0->grid_dims[i] : pf->grid_dims[i];
+            dx0_overlay[i] = (pf->prob_hi[i] - pf->prob_lo[i]) / level0_dims[i];
+        }
+
+        /* Compute current level's cell size for proper physical position */
+        double dx_current_mm[3];
+        for (i = 0; i < 3; i++) {
+            if (pf->level_lo[i] == 0 && pf->grid_dims[i] == level0_dims[i]) {
+                dx_current_mm[i] = dx0_overlay[i];
+            } else {
+                int curr_apparent = pf->level_lo[i] + pf->grid_dims[i];
+                int curr_estimated = level0_dims[i] * pf->ref_ratio[pf->current_level > 0 ? pf->current_level : 1];
+                if (curr_apparent < curr_estimated) curr_apparent = curr_estimated;
+                dx_current_mm[i] = (pf->prob_hi[i] - pf->prob_lo[i]) / curr_apparent;
+            }
+        }
+
+        /* Compute physical position of current slice (same formula as overlay rendering) */
+        double phys_slice = pf->prob_lo[pf->slice_axis] +
+                            (pf->level_lo[pf->slice_axis] + pf->slice_idx + 0.5) * dx_current_mm[pf->slice_axis];
+
+        for (int level = pf->current_level + 1; level < pf->n_levels && level < MAX_LEVELS; level++) {
+            LevelData *ld = &pf->levels[level];
+            if (!ld->loaded || !ld->data) continue;
+
+            /* Compute cell size for this level (same logic as overlay rendering) */
+            double dx_lev[3];
+            for (i = 0; i < 3; i++) {
+                if (ld->level_lo[i] == 0 && ld->grid_dims[i] == level0_dims[i]) {
+                    dx_lev[i] = dx0_overlay[i];
+                } else {
+                    int apparent_full_res = ld->level_lo[i] + ld->grid_dims[i];
+                    int estimated_full_res = level0_dims[i] * pf->ref_ratio[level];
+                    if (apparent_full_res < estimated_full_res) {
+                        apparent_full_res = estimated_full_res;
+                    }
+                    dx_lev[i] = (pf->prob_hi[i] - pf->prob_lo[i]) / apparent_full_res;
+                }
+            }
+
+            /* Compute slice index for this level using same physical position */
+            int lev_slice_idx = (int)((phys_slice - pf->prob_lo[pf->slice_axis]) / dx_lev[pf->slice_axis]);
+            lev_slice_idx -= ld->level_lo[pf->slice_axis];
+
+            if (lev_slice_idx < 0 || lev_slice_idx >= ld->grid_dims[pf->slice_axis]) continue;
+
+            /* Extract slice and find min/max */
+            int lw, lh;
+            if (pf->slice_axis == 2) { lw = ld->grid_dims[0]; lh = ld->grid_dims[1]; }
+            else if (pf->slice_axis == 1) { lw = ld->grid_dims[0]; lh = ld->grid_dims[2]; }
+            else { lw = ld->grid_dims[1]; lh = ld->grid_dims[2]; }
+
+            double *lev_slice = (double *)malloc(lw * lh * sizeof(double));
+            extract_slice_level(ld, lev_slice, pf->slice_axis, lev_slice_idx);
+
+            for (int j = 0; j < lw * lh; j++) {
+                if (lev_slice[j] < vmin) vmin = lev_slice[j];
+                if (lev_slice[j] > vmax) vmax = lev_slice[j];
+            }
+            free(lev_slice);
+        }
+    }
+
     /* Use custom range if set, otherwise use data min/max */
     double display_vmin, display_vmax;
     if (use_custom_range) {
@@ -2569,6 +3069,175 @@ void render_slice(PlotfileData *pf) {
             if (h < 1) h = 1;
 
             XFillRectangle(display, canvas, gc, x, y, w, h);
+        }
+    }
+
+    /* Overlay higher levels if overlay_mode is enabled */
+    printf("render_slice: overlay_mode=%d, n_levels=%d, current_level=%d\n",
+           pf->overlay_mode, pf->n_levels, pf->current_level);
+    if (pf->overlay_mode && pf->n_levels > 1) {
+        /* Level 0 cell size in physical units - MUST use Level 0's grid dimensions */
+        LevelData *ld0 = &pf->levels[0];
+        double dx0[3], dx_level[3];
+        int level0_dims[3];
+        for (i = 0; i < 3; i++) {
+            /* Use Level 0 grid dims, not current level */
+            level0_dims[i] = (ld0->loaded && ld0->grid_dims[i] > 0) ? ld0->grid_dims[i] : pf->grid_dims[i];
+            dx0[i] = (pf->prob_hi[i] - pf->prob_lo[i]) / level0_dims[i];
+        }
+
+        /* Only overlay levels HIGHER than the current level being displayed */
+        int start_level = pf->current_level + 1;
+        printf("render_slice: Overlay loop from level %d to %d\n", start_level, pf->n_levels - 1);
+
+        for (int level = start_level; level < pf->n_levels && level < MAX_LEVELS; level++) {
+            LevelData *ld = &pf->levels[level];
+            printf("render_slice: Level %d: loaded=%d, data=%p\n", level, ld->loaded, (void*)ld->data);
+            if (!ld->loaded || !ld->data) continue;
+
+            /* Detect per-dimension refinement by comparing grid sizes
+             * If a dimension has same grid size and starts at 0, it's not refined */
+            for (i = 0; i < 3; i++) {
+                if (ld->level_lo[i] == 0 && ld->grid_dims[i] == level0_dims[i]) {
+                    /* No refinement in this dimension - same cell size as Level 0 */
+                    dx_level[i] = dx0[i];
+                } else {
+                    /* Refined dimension - compute actual cell size from level indices */
+                    /* The full domain at this level's resolution has (level_hi_max+1) cells */
+                    /* For refined dims: dx = domain_size / (level0_dims * ref_ratio) */
+                    /* Approximate ref_ratio from the level bounds */
+                    int apparent_full_res = ld->level_hi[i] + 1;  /* Assuming level covers to near edge */
+                    if (ld->level_lo[i] > 0) {
+                        /* Level doesn't start at 0, estimate full resolution */
+                        apparent_full_res = ld->level_lo[i] + ld->grid_dims[i];
+                    }
+                    /* Use apparent full resolution to compute cell size */
+                    double domain_size = pf->prob_hi[i] - pf->prob_lo[i];
+                    /* Estimate based on ref_ratio if apparent_full_res seems too small */
+                    int estimated_full_res = level0_dims[i] * pf->ref_ratio[level];
+                    if (apparent_full_res < estimated_full_res) {
+                        apparent_full_res = estimated_full_res;
+                    }
+                    dx_level[i] = domain_size / apparent_full_res;
+                }
+            }
+
+            /* Physical bounds of this level */
+            double level_phys_lo[3], level_phys_hi[3];
+            for (i = 0; i < 3; i++) {
+                level_phys_lo[i] = pf->prob_lo[i] + ld->level_lo[i] * dx_level[i];
+                level_phys_hi[i] = pf->prob_lo[i] + (ld->level_hi[i] + 1) * dx_level[i];
+            }
+
+            /* Compute the current view level's cell size for proper slice mapping */
+            double dx_current[3];
+            for (i = 0; i < 3; i++) {
+                /* Current level cell size: use pf->level_lo to detect if refined */
+                if (pf->level_lo[i] == 0 && pf->grid_dims[i] == level0_dims[i]) {
+                    dx_current[i] = dx0[i];  /* Not refined */
+                } else {
+                    /* Refined - compute from current level's apparent resolution */
+                    int curr_apparent = pf->level_lo[i] + pf->grid_dims[i];
+                    int curr_estimated = level0_dims[i] * pf->ref_ratio[pf->current_level > 0 ? pf->current_level : 1];
+                    if (curr_apparent < curr_estimated) curr_apparent = curr_estimated;
+                    dx_current[i] = (pf->prob_hi[i] - pf->prob_lo[i]) / curr_apparent;
+                }
+            }
+
+            /* Determine level slice dimensions */
+            int lwidth, lheight;
+            int level_slice_idx;
+            double level_x_lo, level_x_hi, level_y_lo, level_y_hi;
+
+            /* Compute physical position of current slice using current level's cell size */
+            double phys_slice_pos = pf->prob_lo[pf->slice_axis] +
+                                    (pf->level_lo[pf->slice_axis] + pf->slice_idx + 0.5) * dx_current[pf->slice_axis];
+
+            if (pf->slice_axis == 2) {  /* Z slice */
+                lwidth = ld->grid_dims[0];
+                lheight = ld->grid_dims[1];
+                level_x_lo = level_phys_lo[0];
+                level_x_hi = level_phys_hi[0];
+                level_y_lo = level_phys_lo[1];
+                level_y_hi = level_phys_hi[1];
+                /* Map physical position to overlay level's slice index */
+                level_slice_idx = (int)((phys_slice_pos - pf->prob_lo[2]) / dx_level[2]);
+                level_slice_idx = level_slice_idx - ld->level_lo[2];
+            } else if (pf->slice_axis == 1) {  /* Y slice */
+                lwidth = ld->grid_dims[0];
+                lheight = ld->grid_dims[2];
+                level_x_lo = level_phys_lo[0];
+                level_x_hi = level_phys_hi[0];
+                level_y_lo = level_phys_lo[2];
+                level_y_hi = level_phys_hi[2];
+                level_slice_idx = (int)((phys_slice_pos - pf->prob_lo[1]) / dx_level[1]);
+                level_slice_idx = level_slice_idx - ld->level_lo[1];
+            } else {  /* X slice */
+                lwidth = ld->grid_dims[1];
+                lheight = ld->grid_dims[2];
+                level_x_lo = level_phys_lo[1];
+                level_x_hi = level_phys_hi[1];
+                level_y_lo = level_phys_lo[2];
+                level_y_hi = level_phys_hi[2];
+                level_slice_idx = (int)((phys_slice_pos - pf->prob_lo[0]) / dx_level[0]);
+                level_slice_idx = level_slice_idx - ld->level_lo[0];
+            }
+
+            /* Check if slice is within this level's bounds */
+            if (level_slice_idx < 0 || level_slice_idx >= ld->grid_dims[pf->slice_axis]) {
+                continue;  /* Slice not in this level */
+            }
+
+            /* Extract slice from this level */
+            double *level_slice = (double *)malloc(lwidth * lheight * sizeof(double));
+            extract_slice_level(ld, level_slice, pf->slice_axis, level_slice_idx);
+
+            /* Apply colormap to level slice */
+            unsigned long *level_pixels = (unsigned long *)malloc(lwidth * lheight * sizeof(unsigned long));
+            apply_colormap(level_slice, lwidth, lheight, level_pixels, display_vmin, display_vmax, pf->colormap);
+
+            /* Map level physical bounds to screen coordinates */
+            double frac_x_lo = (level_x_lo - phys_xmin) / (phys_xmax - phys_xmin);
+            double frac_x_hi = (level_x_hi - phys_xmin) / (phys_xmax - phys_xmin);
+            double frac_y_lo = (level_y_lo - phys_ymin) / (phys_ymax - phys_ymin);
+            double frac_y_hi = (level_y_hi - phys_ymin) / (phys_ymax - phys_ymin);
+
+            int screen_x0 = offset_x + (int)(frac_x_lo * render_width);
+            int screen_x1 = offset_x + (int)(frac_x_hi * render_width);
+            int screen_y0 = offset_y + render_height - (int)(frac_y_hi * render_height);
+            int screen_y1 = offset_y + render_height - (int)(frac_y_lo * render_height);
+
+            double lpixel_width = (double)(screen_x1 - screen_x0) / lwidth;
+            double lpixel_height = (double)(screen_y1 - screen_y0) / lheight;
+
+            /* Draw level pixels */
+            for (int lj = 0; lj < lheight; lj++) {
+                for (int li = 0; li < lwidth; li++) {
+                    unsigned long pixel = level_pixels[lj * lwidth + li];
+                    XSetForeground(display, gc, pixel);
+
+                    int lx = screen_x0 + (int)(li * lpixel_width);
+                    int flipped_lj = lheight - 1 - lj;
+                    int ly = screen_y0 + (int)(flipped_lj * lpixel_height);
+                    int lw = (int)((li + 1) * lpixel_width) - (int)(li * lpixel_width);
+                    int lh = (int)((flipped_lj + 1) * lpixel_height) - (int)(flipped_lj * lpixel_height);
+                    if (lw < 1) lw = 1;
+                    if (lh < 1) lh = 1;
+
+                    XFillRectangle(display, canvas, gc, lx, ly, lw, lh);
+                }
+            }
+
+            /* Draw box outline for this level (optional - helps visualize refined regions) */
+            XSetForeground(display, gc, 0xFF0000);  /* Red */
+            XDrawRectangle(display, canvas, gc, screen_x0, screen_y0,
+                           screen_x1 - screen_x0, screen_y1 - screen_y0);
+
+            free(level_slice);
+            free(level_pixels);
+
+            printf("Overlay level %d: slice %d, screen [%d,%d]-[%d,%d]\n",
+                   level, level_slice_idx, screen_x0, screen_y0, screen_x1, screen_y1);
         }
     }
 
