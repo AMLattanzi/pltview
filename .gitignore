@@ -8,6 +8,7 @@ __pycache__/
 
 # C compiled binaries
 pltview_c
+pltview_pkg/pltview_bin
 *.o
 
 # Distribution / packaging
@@ -51,4 +52,4 @@ env/
 htmlcov/
 
 # AMReX plotfiles (optional - comment out if you want to track test data)
-plt*/
+plt[0-9]*/

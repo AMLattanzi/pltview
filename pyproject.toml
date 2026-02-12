@@ -29,3 +29,7 @@ Repository = "https://github.com/wang1202/pltview"
 
 [tool.setuptools]
 py-modules = ["pltview_entry"]
+packages = ["pltview_pkg"]
+
+[tool.setuptools.package-data]
+pltview_pkg = ["pltview_bin"]
