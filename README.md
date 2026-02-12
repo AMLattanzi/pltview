@@ -52,6 +52,22 @@ make
 # Changes take effect immediately - pltview command uses the updated binary
 ```
 
+### Upgrading
+
+If you already have pltview installed and want to upgrade to the latest version:
+
+```bash
+pip install --upgrade git+https://github.com/wang1202/pltview.git
+```
+
+For editable installs, pull the latest changes and rebuild:
+
+```bash
+cd pltview
+git pull
+make
+```
+
 ### From Source (Manual Build)
 
 ```bash
