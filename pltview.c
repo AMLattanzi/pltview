@@ -253,6 +253,7 @@ void show_distribution(PlotfileData *pf);
 void quiver_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void show_quiver_dialog(PlotfileData *pf);
 int find_variable_index(PlotfileData *pf, const char *name);
+int find_velocity_component(PlotfileData *pf, const char *primary, char fallback_char);
 void get_default_quiver_components(PlotfileData *pf, char *x_comp, char *y_comp);
 void quiver_apply_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void quiver_close_callback(Widget w, XtPointer client_data, XtPointer call_data);
@@ -4682,22 +4683,72 @@ int find_variable_index(PlotfileData *pf, const char *name) {
     return -1;
 }
 
+/* Helper function to find a velocity component with fallback patterns */
+int find_velocity_component(PlotfileData *pf, const char *primary, char fallback_char) {
+    int idx;
+    char patterns[4][64];
+    
+    /* Try primary name (e.g., "x_velocity") */
+    if ((idx = find_variable_index(pf, primary)) >= 0) {
+        return idx;
+    }
+    
+    /* Try simple single letter (e.g., "u", "v", "w") */
+    snprintf(patterns[0], sizeof(patterns[0]), "%c", fallback_char);
+    if ((idx = find_variable_index(pf, patterns[0])) >= 0) {
+        return idx;
+    }
+    
+    /* Try patterns with underscore prefix (e.g., "u_gas", "v_gas", "w_gas") */
+    for (int i = 0; i < pf->n_vars; i++) {
+        if (strlen(pf->variables[i]) >= 2 && 
+            pf->variables[i][0] == fallback_char && 
+            pf->variables[i][1] == '_') {
+            return i;
+        }
+    }
+    
+    return -1;
+}
+
 /* Get default component names based on current slice axis */
 void get_default_quiver_components(PlotfileData *pf, char *x_comp, char *y_comp) {
+    int x_idx, y_idx;
+    const char *primary_x, *primary_y;
+    char fallback_x, fallback_y;
+    
+    /* Determine primary names and fallback characters based on slice axis */
     switch (pf->slice_axis) {
         case 0:  /* X plane - show Y and Z velocity */
-            strcpy(x_comp, "y_velocity");
-            strcpy(y_comp, "z_velocity");
+            primary_x = "y_velocity"; fallback_x = 'v';
+            primary_y = "z_velocity"; fallback_y = 'w';
             break;
         case 1:  /* Y plane - show X and Z velocity */
-            strcpy(x_comp, "x_velocity");
-            strcpy(y_comp, "z_velocity");
+            primary_x = "x_velocity"; fallback_x = 'u';
+            primary_y = "z_velocity"; fallback_y = 'w';
             break;
         case 2:  /* Z plane - show X and Y velocity */
         default:
-            strcpy(x_comp, "x_velocity");
-            strcpy(y_comp, "y_velocity");
+            primary_x = "x_velocity"; fallback_x = 'u';
+            primary_y = "y_velocity"; fallback_y = 'v';
             break;
+    }
+    
+    /* Find components with fallback logic */
+    x_idx = find_velocity_component(pf, primary_x, fallback_x);
+    y_idx = find_velocity_component(pf, primary_y, fallback_y);
+    
+    /* Set component names based on what was found */
+    if (x_idx >= 0) {
+        strcpy(x_comp, pf->variables[x_idx]);
+    } else {
+        strcpy(x_comp, primary_x);  /* Fall back to primary name */
+    }
+    
+    if (y_idx >= 0) {
+        strcpy(y_comp, pf->variables[y_idx]);
+    } else {
+        strcpy(y_comp, primary_y);  /* Fall back to primary name */
     }
 }
 
