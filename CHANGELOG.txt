@@ -1,6 +1,10 @@
 Changelog
 =========
 
+v0.3.4
+------
+- Fix 2D plotfile handling by ensuring grid dimensions use a non-zero third axis
+
 v0.3.3
 ------
 - Map overlay now relies only on GeoJSON layers (removed US coastline fallback)

@@ -962,6 +962,10 @@ int read_header(PlotfileData *pf) {
     for (i = 0; i < pf->ndim; i++) {
         pf->grid_dims[i] = hi[i] - lo[i] + 1;
     }
+    /* For 2D data, ensure the unused dimension is 1 (not 0) */
+    for (i = pf->ndim; i < 3; i++) {
+        pf->grid_dims[i] = 1;
+    }
     
     fclose(fp);
     
@@ -1063,10 +1067,11 @@ int read_cell_h(PlotfileData *pf) {
         pf->level_hi[i] = level_hi[i];
         pf->grid_dims[i] = level_hi[i] - level_lo[i] + 1;
     }
-    /* Initialize any remaining dimensions to 0 for 2D cases */
+    /* Initialize any remaining dimensions for 2D cases */
     for (i = pf->ndim; i < 3; i++) {
         pf->level_lo[i] = 0;
         pf->level_hi[i] = 0;
+        pf->grid_dims[i] = 1;
     }
 
     printf("Level %d: Found %d boxes, Grid: %d x %d x %d (lo: %d,%d,%d)\n",
