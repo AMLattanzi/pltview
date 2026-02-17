@@ -2171,28 +2171,15 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     XtSetArg(args[n], XtNwidth, 200); n++;
     var_panel = XtCreateManagedWidget("varPanel", formWidgetClass, form, args, n);
 
-    /* Vertical scrollbar for variables */
+    /* Variable buttons viewport (use internal scrollbar) */
     n = 0;
-    XtSetArg(args[n], XtNorientation, XtorientVertical); n++;
-    XtSetArg(args[n], XtNtop, XawChainTop); n++;
-    XtSetArg(args[n], XtNbottom, XawChainBottom); n++;
-    XtSetArg(args[n], XtNleft, XawChainLeft); n++;
-    XtSetArg(args[n], XtNheight, canvas_height); n++;
-    XtSetArg(args[n], XtNwidth, 14); n++;
-    var_scrollbar = XtCreateManagedWidget("varScrollbar", scrollbarWidgetClass, var_panel, args, n);
-    XtAddCallback(var_scrollbar, XtNscrollProc, var_scrollbar_scroll_proc, NULL);
-    XtAddCallback(var_scrollbar, XtNjumpProc, var_scrollbar_jump_proc, NULL);
-
-    /* Variable buttons viewport (no internal scrollbars) */
-    n = 0;
-    XtSetArg(args[n], XtNfromHoriz, var_scrollbar); n++;
     XtSetArg(args[n], XtNborderWidth, 0); n++;
     XtSetArg(args[n], XtNtop, XawChainTop); n++;
     XtSetArg(args[n], XtNbottom, XawChainBottom); n++;
     XtSetArg(args[n], XtNleft, XawChainLeft); n++;
-    XtSetArg(args[n], XtNallowVert, False); n++;
+    XtSetArg(args[n], XtNallowVert, True); n++;
     XtSetArg(args[n], XtNallowHoriz, False); n++;
-    XtSetArg(args[n], XtNforceBars, False); n++;
+    XtSetArg(args[n], XtNforceBars, True); n++;
     XtSetArg(args[n], XtNheight, canvas_height); n++;
     XtSetArg(args[n], XtNwidth, 180); n++;
     var_viewport = XtCreateManagedWidget("varViewport", viewportWidgetClass, var_panel, args, n);

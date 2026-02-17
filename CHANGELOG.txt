@@ -1,6 +1,10 @@
 Changelog
 =========
 
+v0.3.6
+------
+- Use a single scrollbar for the variable list
+
 v0.3.5
 ------
 - Add a dedicated scrollable variable list to prevent UI compression and enable scrolling both directions
