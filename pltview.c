@@ -224,12 +224,15 @@ Widget sdm_dialog_shell = NULL;
 Widget overlay_button = NULL;  /* Overlay toggle button */
 Widget map_dialog_shell = NULL;
 Widget map_unavailable_shell = NULL;
+Widget map_unavailable_label = NULL;
 int map_color_option = 0;  /* 0=black, 1=red, 2=gray, 3=white */
 unsigned long map_color_pixel = 0;
 int map_coastlines_enabled = 1;
 double map_last_lon_min = 0.0, map_last_lon_max = 0.0, map_last_lat_min = 0.0, map_last_lat_max = 0.0;
 int map_has_bounds = 0;
 int map_auto_detected = 0;
+static char map_layers_dir[MAX_PATH] = "";
+static int map_layers_available = 0;
 
 #define MAX_COASTLINES 64
 typedef struct {
@@ -281,7 +284,7 @@ void var_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void axis_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void map_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void show_map_settings_dialog(PlotfileData *pf);
-void show_map_unavailable_dialog(void);
+void show_map_unavailable_dialog(const char *message);
 void map_color_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void map_remove_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void map_unavailable_ok_callback(Widget w, XtPointer client_data, XtPointer call_data);
@@ -2570,6 +2573,10 @@ void map_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
         int lat_idx = find_variable_index(global_pf, "lat_m");
         
         if (lon_idx >= 0 && lat_idx >= 0) {
+            if (!map_layers_available) {
+                show_map_unavailable_dialog("Map layers not installed. Reinstall with --map.");
+                return;
+            }
             /* Toggle map mode */
             global_pf->map_mode = !global_pf->map_mode;
 
@@ -2590,7 +2597,7 @@ void map_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
             }
         } else {
             printf("Map mode requires lon_m and lat_m variables (not found)\n");
-            show_map_unavailable_dialog();
+            show_map_unavailable_dialog("lat_m and lon_m are not available");
         }
     }
 }
@@ -2622,10 +2629,43 @@ static void update_map_color_pixel(void) {
     }
 }
 
+static int dir_exists(const char *path) {
+    struct stat st;
+    return (path && path[0] && stat(path, &st) == 0 && S_ISDIR(st.st_mode));
+}
+
+static void init_map_layers_dir(const char *argv0) {
+    const char *env_dir = getenv("PLTVIEW_MAP_LAYERS");
+    if (dir_exists(env_dir)) {
+        strncpy(map_layers_dir, env_dir, sizeof(map_layers_dir) - 1);
+        map_layers_dir[sizeof(map_layers_dir) - 1] = '\0';
+    } else if (dir_exists("map_layers")) {
+        strncpy(map_layers_dir, "map_layers", sizeof(map_layers_dir) - 1);
+        map_layers_dir[sizeof(map_layers_dir) - 1] = '\0';
+    } else if (argv0 && argv0[0]) {
+        char resolved[MAX_PATH];
+        if (realpath(argv0, resolved)) {
+            char *slash = strrchr(resolved, '/');
+            if (slash) {
+                *slash = '\0';
+                char candidate[MAX_PATH];
+                snprintf(candidate, sizeof(candidate), "%s/map_layers", resolved);
+                if (dir_exists(candidate)) {
+                    strncpy(map_layers_dir, candidate, sizeof(map_layers_dir) - 1);
+                    map_layers_dir[sizeof(map_layers_dir) - 1] = '\0';
+                }
+            }
+        }
+    }
+
+    map_layers_available = dir_exists(map_layers_dir);
+}
+
 static void scan_coastline_files(void) {
     if (n_coastlines > 0) return;
+    if (!map_layers_available) return;
 
-    DIR *dir = opendir("map_layers");
+    DIR *dir = opendir(map_layers_dir);
     if (!dir) return;
 
     struct dirent *entry;
@@ -2642,7 +2682,7 @@ static void scan_coastline_files(void) {
         if (n_coastlines >= MAX_COASTLINES) break;
 
         CoastlineEntry *ce = &coastlines[n_coastlines++];
-        snprintf(ce->filename, sizeof(ce->filename), "map_layers/%s", name);
+        snprintf(ce->filename, sizeof(ce->filename), "%s/%s", map_layers_dir, name);
 
         /* Build label without extension */
         strncpy(ce->label, name, sizeof(ce->label) - 1);
@@ -2903,8 +2943,13 @@ void map_unavailable_ok_callback(Widget w, XtPointer client_data, XtPointer call
     }
 }
 
-void show_map_unavailable_dialog(void) {
+void show_map_unavailable_dialog(const char *message) {
+    const char *label_text = (message && message[0]) ? message : "Map is unavailable";
+
     if (map_unavailable_shell) {
+        if (map_unavailable_label) {
+            XtVaSetValues(map_unavailable_label, XtNlabel, label_text, NULL);
+        }
         XtPopup(map_unavailable_shell, XtGrabNone);
         return;
     }
@@ -2916,14 +2961,14 @@ void show_map_unavailable_dialog(void) {
 
     Widget msg_form = XtVaCreateManagedWidget("mapUnavailableForm", formWidgetClass,
                                               map_unavailable_shell, NULL);
-    Widget msg_label = XtVaCreateManagedWidget("mapUnavailableLabel", labelWidgetClass,
-                                               msg_form,
-                                               XtNlabel, "lat_m and lon_m are not available",
-                                               XtNborderWidth, 0,
-                                               NULL);
+    map_unavailable_label = XtVaCreateManagedWidget("mapUnavailableLabel", labelWidgetClass,
+                                                    msg_form,
+                                                    XtNlabel, label_text,
+                                                    XtNborderWidth, 0,
+                                                    NULL);
     Widget ok_btn = XtVaCreateManagedWidget("mapUnavailableOk", commandWidgetClass, msg_form,
                                             XtNlabel, "OK",
-                                            XtNfromVert, msg_label,
+                                            XtNfromVert, map_unavailable_label,
                                             NULL);
 
     XtAddCallback(ok_btn, XtNcallback, map_unavailable_ok_callback, NULL);
@@ -7873,6 +7918,8 @@ int main(int argc, char **argv) {
     Arg args[2];
     char check_path[MAX_PATH];
     const char *prefix = "plt";  /* Default prefix */
+
+    init_map_layers_dir(argv[0]);
 
     /* Check for --sdm flag */
     for (int i = 1; i < argc; i++) {

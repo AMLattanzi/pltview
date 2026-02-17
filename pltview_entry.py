@@ -10,10 +10,13 @@ def main():
     # Method 1: Inside installed package (works for both pip install and editable)
     binary = None
     try:
-        from pltview_pkg import get_binary_path
+        from pltview_pkg import get_binary_path, get_map_layers_path
         candidate = get_binary_path()
         if os.path.exists(candidate):
             binary = candidate
+        map_layers_path = get_map_layers_path()
+        if map_layers_path:
+            os.environ.setdefault("PLTVIEW_MAP_LAYERS", map_layers_path)
     except ImportError:
         pass
 

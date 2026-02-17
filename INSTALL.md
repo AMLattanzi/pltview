@@ -8,6 +8,20 @@ On your Linux server or macOS system with X11:
 pip install git+https://github.com/wang1202/pltview.git
 ```
 
+### Optional: Install Map Layers (Map: ON)
+
+Map layers are optional and not installed by default. To include them:
+
+```bash
+pip install --no-use-pep517 --install-option=--map git+https://github.com/wang1202/pltview.git
+```
+
+Or using an environment variable:
+
+```bash
+PLTVIEW_WITH_MAP=1 pip install git+https://github.com/wang1202/pltview.git
+```
+
 The installation will automatically compile the C version.
 
 ## Prerequisites

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pltview"
-version = "0.4.0"
+version = "0.4.1"
 description = "Lightweight C viewer for AMReX plotfiles, inspired by ncview"
 readme = "README.md"
 requires-python = ">=3.6"
@@ -32,4 +32,4 @@ py-modules = ["pltview_entry"]
 packages = ["pltview_pkg"]
 
 [tool.setuptools.package-data]
-pltview_pkg = ["pltview_bin"]
+pltview_pkg = ["pltview_bin", "map_layers/*.json", "map_layers/*.geojson"]

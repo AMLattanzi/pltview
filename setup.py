@@ -5,6 +5,7 @@ from setuptools.command.build import build
 from setuptools.command.editable_wheel import editable_wheel
 import subprocess
 import os
+import shutil
 
 
 def build_c_binary():
@@ -62,37 +63,85 @@ def build_c_binary():
         raise RuntimeError("gcc not found. Please install gcc compiler.")
 
 
-class BuildC(build):
+def _env_flag_set(name: str) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def copy_map_layers():
+    """Copy map_layers into pltview_pkg/map_layers for packaging."""
+    src_dir = os.path.dirname(__file__) or '.'
+    src = os.path.join(src_dir, 'map_layers')
+    if not os.path.isdir(src):
+        print("map_layers directory not found; skipping map layer install.")
+        return
+    dst = os.path.join(src_dir, 'pltview_pkg', 'map_layers')
+    if os.path.isdir(dst):
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst)
+    print("✓ Map layers copied into pltview_pkg/map_layers")
+
+
+class MapOptionMixin:
+    def initialize_options(self):
+        super().initialize_options()
+        self.map = False
+
+    def finalize_options(self):
+        super().finalize_options()
+
+    def _maybe_copy_map_layers(self):
+        if self.map or _env_flag_set("PLTVIEW_WITH_MAP"):
+            copy_map_layers()
+
+
+class BuildC(MapOptionMixin, build):
     """Custom build command that compiles C version"""
+
+    user_options = build.user_options + [('map', None, 'Include map layers (requires map_layers directory)')]
+    boolean_options = getattr(build, 'boolean_options', []) + ['map']
 
     def run(self):
         build_c_binary()
+        self._maybe_copy_map_layers()
         super().run()
 
 
-class EditableWheel(editable_wheel):
+class EditableWheel(MapOptionMixin, editable_wheel):
     """Custom editable_wheel command to build C binary"""
+
+    user_options = editable_wheel.user_options + [('map', None, 'Include map layers (requires map_layers directory)')]
+    boolean_options = getattr(editable_wheel, 'boolean_options', []) + ['map']
 
     def run(self):
         print("Running editable_wheel - building C binary...")
         build_c_binary()
+        self._maybe_copy_map_layers()
         super().run()
 
 
-class InstallC(install):
+class InstallC(MapOptionMixin, install):
     """Custom install command that installs C binary"""
+
+    user_options = install.user_options + [('map', None, 'Include map layers (requires map_layers directory)')]
+    boolean_options = getattr(install, 'boolean_options', []) + ['map']
 
     def run(self):
         build_c_binary()
+        self._maybe_copy_map_layers()
         super().run()
 
 
-class DevelopC(develop):
+class DevelopC(MapOptionMixin, develop):
     """Custom develop command for editable install"""
+
+    user_options = develop.user_options + [('map', None, 'Include map layers (requires map_layers directory)')]
+    boolean_options = getattr(develop, 'boolean_options', []) + ['map']
 
     def run(self):
         print("Running develop - building C binary...")
         build_c_binary()
+        self._maybe_copy_map_layers()
         super().run()
 
 
