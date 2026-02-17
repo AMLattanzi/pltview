@@ -37,24 +37,16 @@ pip install git+ssh://git@github.com/wang1202/pltview.git
 
 ### Optional: Install Map Layers (Map: ON)
 
-Map layers are not installed by default. To enable the Map: ON feature with coastlines, install with `--map`:
+Map layers are not installed by default. To enable the Map: ON feature with coastlines, set `PLTVIEW_WITH_MAP=1`:
 
 ```bash
-pip install --no-use-pep517 --install-option=--map git+https://github.com/wang1202/pltview.git
+PLTVIEW_WITH_MAP=1 pip install git+https://github.com/wang1202/pltview.git
 ```
 
 or
 
 ```bash
-pip install --no-use-pep517 --install-option=--map git+ssh://git@github.com/wang1202/pltview.git
-```
-
-`--no-use-pep517` tells pip to use the legacy `setup.py` installer so `--install-option=--map` is honored.
-
-If you prefer environment variables instead of `--map`:
-
-```bash
-PLTVIEW_WITH_MAP=1 pip install git+https://github.com/wang1202/pltview.git
+PLTVIEW_WITH_MAP=1 pip install git+ssh://git@github.com/wang1202/pltview.git
 ```
 
 ### Editable Install (For Development)
@@ -85,7 +77,7 @@ pip install --upgrade git+https://github.com/wang1202/pltview.git
 To upgrade and include map layers:
 
 ```bash
-pip install --upgrade --no-use-pep517 --install-option=--map git+https://github.com/wang1202/pltview.git
+PLTVIEW_WITH_MAP=1 pip install --upgrade git+https://github.com/wang1202/pltview.git
 ```
 
 For editable installs, pull the latest changes and rebuild:

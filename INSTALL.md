@@ -10,13 +10,7 @@ pip install git+https://github.com/wang1202/pltview.git
 
 ### Optional: Install Map Layers (Map: ON)
 
-Map layers are optional and not installed by default. To include them:
-
-```bash
-pip install --no-use-pep517 --install-option=--map git+https://github.com/wang1202/pltview.git
-```
-
-Or using an environment variable:
+Map layers are optional and not installed by default. To include them, set `PLTVIEW_WITH_MAP=1`:
 
 ```bash
 PLTVIEW_WITH_MAP=1 pip install git+https://github.com/wang1202/pltview.git
