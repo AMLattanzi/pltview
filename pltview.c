@@ -165,6 +165,17 @@ int slice_width = 0, slice_height = 0;
 int render_offset_x = 0, render_offset_y = 0;
 int render_width = 0, render_height = 0;
 char hover_value_text[256] = "";
+
+/* Zoom and scroll state */
+double zoom_level = 1.0;        /* 1.0 = no zoom */
+int zoom_scroll_x = 0;          /* Pixel offset into zoomed view (horizontal) */
+int zoom_scroll_y = 0;          /* Pixel offset into zoomed view (vertical) */
+int zoom_dragging = 0;          /* 1 = mouse drag in progress */
+int zoom_drag_start_x = 0;      /* Mouse X at drag start */
+int zoom_drag_start_y = 0;      /* Mouse Y at drag start */
+int zoom_drag_scroll_x0 = 0;    /* scroll_x at drag start */
+int zoom_drag_scroll_y0 = 0;    /* scroll_y at drag start */
+int vis_area_x = 0, vis_area_y = 0, vis_area_w = 0, vis_area_h = 0;  /* Visible clip region on screen */
 int initial_focus_set = 0;  /* Flag for setting keyboard focus on first expose */
 int dialog_active = 0;  /* Flag to track when a dialog is open */
 Widget active_text_widget = NULL;  /* Text widget in active dialog */
@@ -306,6 +317,11 @@ void update_layer_label(PlotfileData *pf);
 void canvas_expose_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void canvas_motion_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch);
 void canvas_button_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch);
+void canvas_button_release_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch);
+void zoom_in_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void zoom_out_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void zoom_reset(void);
+void clamp_zoom_scroll(void);
 void show_line_profiles(PlotfileData *pf, int data_x, int data_y);
 void cleanup(PlotfileData *pf);
 int scan_timesteps(const char *base_dir, const char *prefix);
@@ -764,6 +780,7 @@ int scan_sdm_timesteps(const char *base_dir, const char *prefix) {
 void switch_timestep(PlotfileData *pf, int new_timestep) {
     if (new_timestep < 0 || new_timestep >= n_timesteps) return;
 
+    zoom_reset();
     current_timestep = new_timestep;
 
     /* Update plotfile directory */
@@ -2310,6 +2327,17 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     button = XtCreateManagedWidget("quiver", commandWidgetClass, tools_box, args, n);
     XtAddCallback(button, XtNcallback, quiver_button_callback, NULL);
 
+    /* Zoom buttons */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "Z+"); n++;
+    button = XtCreateManagedWidget("zoomIn", commandWidgetClass, tools_box, args, n);
+    XtAddCallback(button, XtNcallback, zoom_in_callback, NULL);
+
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "Z-"); n++;
+    button = XtCreateManagedWidget("zoomOut", commandWidgetClass, tools_box, args, n);
+    XtAddCallback(button, XtNcallback, zoom_out_callback, NULL);
+
     /* COLUMN 3: Level buttons (show if any timestep has multiple levels) */
     /* Use max_levels_all_timesteps for multi-timestep mode, pf->n_levels for single plotfile */
     int total_levels = (n_timesteps > 1) ? max_levels_all_timesteps : pf->n_levels;
@@ -2437,6 +2465,7 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     /* Add mouse event handlers - use raw event handler for proper event handling */
     XtAddRawEventHandler(canvas_widget, PointerMotionMask, False, canvas_motion_handler, NULL);
     XtAddRawEventHandler(canvas_widget, ButtonPressMask, False, canvas_button_handler, NULL);
+    XtAddRawEventHandler(canvas_widget, ButtonReleaseMask, False, canvas_button_release_handler, NULL);
 }
 
 /* Update info label */
@@ -2500,6 +2529,7 @@ void var_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
             load_all_levels(global_pf, var);
         }
 
+        zoom_reset();
         update_info_label(global_pf);
         render_slice(global_pf);
     }
@@ -2511,6 +2541,7 @@ void axis_button_callback(Widget w, XtPointer client_data, XtPointer call_data) 
     if (global_pf) {
         global_pf->slice_axis = axis;
         global_pf->slice_idx = 0;  /* Start at first layer */
+        zoom_reset();
 
         /* Update quiver components to match new axis */
         if (quiver_data.enabled) {
@@ -2911,6 +2942,7 @@ void level_button_callback(Widget w, XtPointer client_data, XtPointer call_data)
         return;
     }
 
+    zoom_reset();
     global_pf->current_level = level;
 
     /* Reload data for new level */
@@ -3838,34 +3870,66 @@ void render_slice(PlotfileData *pf) {
             /* Set map rendering area */
             int avail_width = canvas_width - left_margin - right_margin;
             int avail_height = canvas_height - top_margin - bottom_margin;
-            
+
             local_render_width = avail_width;
             local_render_height = avail_height;
             offset_x = left_margin;
             offset_y = top_margin;
-            
+
+            /* Save visible area for zoom interaction */
+            vis_area_x = offset_x;
+            vis_area_y = offset_y;
+            vis_area_w = local_render_width;
+            vis_area_h = local_render_height;
+
+            /* Apply zoom */
+            int zoomed_rw = (int)(local_render_width * zoom_level);
+            int zoomed_rh = (int)(local_render_height * zoom_level);
+            int max_sx = zoomed_rw - local_render_width;
+            int max_sy = zoomed_rh - local_render_height;
+            if (max_sx < 0) max_sx = 0;
+            if (max_sy < 0) max_sy = 0;
+            if (zoom_scroll_x > max_sx) zoom_scroll_x = max_sx;
+            if (zoom_scroll_y > max_sy) zoom_scroll_y = max_sy;
+            if (zoom_scroll_x < 0) zoom_scroll_x = 0;
+            if (zoom_scroll_y < 0) zoom_scroll_y = 0;
+            int zoom_base_x = offset_x - zoom_scroll_x;
+            int zoom_base_y = offset_y - zoom_scroll_y;
+
+            if (zoom_level > 1.0) {
+                XRectangle clip = {offset_x, offset_y, local_render_width, local_render_height};
+                XSetClipRectangles(display, gc, 0, 0, &clip, 1, Unsorted);
+            }
+
             /* Create pixel data for individual points */
             unsigned long *point_pixels = (unsigned long *)malloc(width * height * sizeof(unsigned long));
             apply_colormap(slice, width, height, point_pixels, display_vmin, display_vmax, pf->colormap);
-            
+
+            /* Compute dot size: scale with zoom so dots fill the space */
+            int dot_size = (int)(3 * zoom_level);
+            if (dot_size < 3) dot_size = 3;
+            int dot_half = dot_size / 2;
+
             /* Render each data point at its coordinate */
             for (j = 0; j < height; j++) {
                 for (i = 0; i < width; i++) {
                     int idx = j * width + i;
                     double x_coord = x_geo_extent[idx];
                     double y_coord = y_coord_extent[idx];
-                    
+
                     /* Map coordinates to screen coordinates */
                     if (x_coord >= phys_xmin && x_coord <= phys_xmax && y_coord >= phys_ymin && y_coord <= phys_ymax) {
-                        int screen_x = offset_x + (int)((x_coord - phys_xmin) / (phys_xmax - phys_xmin) * local_render_width);
-                        int screen_y = offset_y + (int)((phys_ymax - y_coord) / (phys_ymax - phys_ymin) * local_render_height);
-                        
-                        /* Draw a small rectangle for each data point */
+                        int screen_x = zoom_base_x + (int)((x_coord - phys_xmin) / (phys_xmax - phys_xmin) * zoomed_rw);
+                        int screen_y = zoom_base_y + (int)((phys_ymax - y_coord) / (phys_ymax - phys_ymin) * zoomed_rh);
+
+                        /* Draw a rectangle for each data point, scaled with zoom */
                         XSetForeground(display, gc, point_pixels[idx]);
-                        XFillRectangle(display, canvas, gc, screen_x - 1, screen_y - 1, 3, 3);
+                        XFillRectangle(display, canvas, gc, screen_x - dot_half, screen_y - dot_half, dot_size, dot_size);
                     }
                 }
             }
+
+            if (zoom_level > 1.0) XSetClipMask(display, gc, None);
             
             free(x_geo_slice);
             free(y_coord_slice);
@@ -3876,7 +3940,7 @@ void render_slice(PlotfileData *pf) {
             phys_xmax = pf->prob_hi[x_axis];
             phys_ymin = pf->prob_lo[y_axis];
             phys_ymax = pf->prob_hi[y_axis];
-            
+
             /* Use normal rendering code */
             apply_colormap(slice, width, height, pixel_data, display_vmin, display_vmax, pf->colormap);
 
@@ -3898,8 +3962,33 @@ void render_slice(PlotfileData *pf) {
                 offset_y = top_margin;
             }
 
-            double pixel_width = (double)local_render_width / width;
-            double pixel_height = (double)local_render_height / height;
+            /* Save visible area for zoom interaction */
+            vis_area_x = offset_x;
+            vis_area_y = offset_y;
+            vis_area_w = local_render_width;
+            vis_area_h = local_render_height;
+
+            /* Apply zoom */
+            int zoomed_rw = (int)(local_render_width * zoom_level);
+            int zoomed_rh = (int)(local_render_height * zoom_level);
+            int max_sx = zoomed_rw - local_render_width;
+            int max_sy = zoomed_rh - local_render_height;
+            if (max_sx < 0) max_sx = 0;
+            if (max_sy < 0) max_sy = 0;
+            if (zoom_scroll_x > max_sx) zoom_scroll_x = max_sx;
+            if (zoom_scroll_y > max_sy) zoom_scroll_y = max_sy;
+            if (zoom_scroll_x < 0) zoom_scroll_x = 0;
+            if (zoom_scroll_y < 0) zoom_scroll_y = 0;
+            int zoom_base_x = offset_x - zoom_scroll_x;
+            int zoom_base_y = offset_y - zoom_scroll_y;
+
+            if (zoom_level > 1.0) {
+                XRectangle clip = {offset_x, offset_y, local_render_width, local_render_height};
+                XSetClipRectangles(display, gc, 0, 0, &clip, 1, Unsorted);
+            }
+
+            double pixel_width = (double)zoomed_rw / width;
+            double pixel_height = (double)zoomed_rh / height;
 
             for (j = 0; j < height; j++) {
                 for (i = 0; i < width; i++) {
@@ -3908,9 +3997,9 @@ void render_slice(PlotfileData *pf) {
                     unsigned long pixel = pixel_data[j * width + i];
                     XSetForeground(display, gc, pixel);
 
-                    int x = offset_x + (int)(i * pixel_width);
+                    int x = zoom_base_x + (int)(i * pixel_width);
                     int flipped_j = height - 1 - j;
-                    int y = offset_y + (int)(flipped_j * pixel_height);
+                    int y = zoom_base_y + (int)(flipped_j * pixel_height);
                     int w = (int)((i + 1) * pixel_width) - (int)(i * pixel_width);
                     int h = (int)((flipped_j + 1) * pixel_height) - (int)(flipped_j * pixel_height);
                     if (w < 1) w = 1;
@@ -3919,6 +4008,8 @@ void render_slice(PlotfileData *pf) {
                     XFillRectangle(display, canvas, gc, x, y, w, h);
                 }
             }
+
+            if (zoom_level > 1.0) XSetClipMask(display, gc, None);
         }
     } else {
         /* Normal mode: apply colormap and render as regular grid */
@@ -3946,21 +4037,64 @@ void render_slice(PlotfileData *pf) {
             offset_y = top_margin;
         }
 
-        /* Draw pixels as filled rectangles with correct aspect ratio */
-        double pixel_width = (double)local_render_width / width;
-        double pixel_height = (double)local_render_height / height;
+        /* Save visible area for zoom interaction */
+        vis_area_x = offset_x;
+        vis_area_y = offset_y;
+        vis_area_w = local_render_width;
+        vis_area_h = local_render_height;
 
-        for (j = 0; j < height; j++) {
-            for (i = 0; i < width; i++) {
+        /* Apply zoom */
+        int zoomed_rw = (int)(local_render_width * zoom_level);
+        int zoomed_rh = (int)(local_render_height * zoom_level);
+
+        /* Clamp scroll offsets */
+        int max_sx = zoomed_rw - local_render_width;
+        int max_sy = zoomed_rh - local_render_height;
+        if (max_sx < 0) max_sx = 0;
+        if (max_sy < 0) max_sy = 0;
+        if (zoom_scroll_x > max_sx) zoom_scroll_x = max_sx;
+        if (zoom_scroll_y > max_sy) zoom_scroll_y = max_sy;
+        if (zoom_scroll_x < 0) zoom_scroll_x = 0;
+        if (zoom_scroll_y < 0) zoom_scroll_y = 0;
+
+        /* Compute zoomed rendering base (may be off-screen) */
+        int zoom_base_x = offset_x - zoom_scroll_x;
+        int zoom_base_y = offset_y - zoom_scroll_y;
+
+        /* Set clip region to visible data area when zoomed */
+        if (zoom_level > 1.0) {
+            XRectangle clip = {offset_x, offset_y, local_render_width, local_render_height};
+            XSetClipRectangles(display, gc, 0, 0, &clip, 1, Unsorted);
+        }
+
+        /* Draw pixels as filled rectangles with correct aspect ratio */
+        double pixel_width = (double)zoomed_rw / width;
+        double pixel_height = (double)zoomed_rh / height;
+
+        /* Compute visible cell range for performance optimization */
+        int i_start = 0, i_end = width, j_start = 0, j_end = height;
+        if (zoom_level > 1.0) {
+            i_start = (int)((double)zoom_scroll_x / pixel_width);
+            i_end = (int)((double)(zoom_scroll_x + local_render_width) / pixel_width) + 2;
+            j_start = height - 1 - (int)((double)(zoom_scroll_y + local_render_height) / pixel_height) - 1;
+            j_end = height - 1 - (int)((double)zoom_scroll_y / pixel_height) + 2;
+            if (i_start < 0) i_start = 0;
+            if (i_end > width) i_end = width;
+            if (j_start < 0) j_start = 0;
+            if (j_end > height) j_end = height;
+        }
+
+        for (j = j_start; j < j_end; j++) {
+            for (i = i_start; i < i_end; i++) {
                 if (base_in_box && !base_in_box[j * width + i]) continue;
 
                 unsigned long pixel = pixel_data[j * width + i];
                 XSetForeground(display, gc, pixel);
 
-                int x = offset_x + (int)(i * pixel_width);
+                int x = zoom_base_x + (int)(i * pixel_width);
                 /* Flip y-axis: higher j (higher y in data) should be at top of screen */
                 int flipped_j = height - 1 - j;
-                int y = offset_y + (int)(flipped_j * pixel_height);
+                int y = zoom_base_y + (int)(flipped_j * pixel_height);
                 int w = (int)((i + 1) * pixel_width) - (int)(i * pixel_width);
                 int h = (int)((flipped_j + 1) * pixel_height) - (int)(flipped_j * pixel_height);
                 if (w < 1) w = 1;
@@ -3969,13 +4103,32 @@ void render_slice(PlotfileData *pf) {
                 XFillRectangle(display, canvas, gc, x, y, w, h);
             }
         }
+
+        /* Reset clip for non-data elements */
+        if (zoom_level > 1.0) XSetClipMask(display, gc, None);
     }
 
-    /* Store rendering parameters for mouse interaction */
-    render_offset_x = offset_x;
-    render_offset_y = offset_y;
-    render_width = local_render_width;
-    render_height = local_render_height;
+    /* Store rendering parameters for mouse interaction (use zoomed values) */
+    {
+        int zoomed_rw = (int)(local_render_width * zoom_level);
+        int zoomed_rh = (int)(local_render_height * zoom_level);
+        int zoom_base_x = offset_x - zoom_scroll_x;
+        int zoom_base_y = offset_y - zoom_scroll_y;
+        render_offset_x = zoom_base_x;
+        render_offset_y = zoom_base_y;
+        render_width = zoomed_rw;
+        render_height = zoomed_rh;
+    }
+
+    /* For overlay and subsequent rendering, use zoomed coordinate system */
+    if (zoom_level > 1.0) {
+        offset_x = render_offset_x;
+        offset_y = render_offset_y;
+        local_render_width = render_width;
+        local_render_height = render_height;
+        XRectangle clip = {vis_area_x, vis_area_y, vis_area_w, vis_area_h};
+        XSetClipRectangles(display, gc, 0, 0, &clip, 1, Unsorted);
+    }
 
     /* Overlay higher levels if overlay_mode is enabled */
     printf("render_slice: overlay_mode=%d, n_levels=%d, current_level=%d\n",
@@ -4093,6 +4246,214 @@ void render_slice(PlotfileData *pf) {
                 continue;  /* Slice not in this level */
             }
 
+            /* Map mode overlay: draw only box boundaries using geographic coordinates
+             * so they curve to follow the map projection instead of appearing as
+             * straight rectangles. */
+            if (pf->map_mode) {
+                int lon_idx_m = find_variable_index(pf, "lon_m");
+                int lat_idx_m = find_variable_index(pf, "lat_m");
+
+                /* Determine which geo variable(s) we need for each screen axis */
+                int geo_x_var = -1, geo_y_var = -1;
+                int need_geo_y = 0;  /* Whether y-axis needs a geo variable (vs physical Z) */
+
+                if (pf->slice_axis == 2) {
+                    /* Z-slice: lon as x, lat as y */
+                    geo_x_var = lon_idx_m;
+                    geo_y_var = lat_idx_m;
+                    need_geo_y = 1;
+                } else if (pf->slice_axis == 1) {
+                    /* Y-slice: lon as x, Z as y */
+                    geo_x_var = lon_idx_m;
+                } else {
+                    /* X-slice: lat as x, Z as y */
+                    geo_x_var = lat_idx_m;
+                }
+
+                if (geo_x_var < 0) goto skip_map_overlay;
+
+                /* Read geo coordinate data for this level by temporarily using ld->data.
+                 * Save and restore the original variable data pointer. */
+                double *saved_data = ld->data;
+
+                ld->data = NULL;
+                read_variable_data_level(pf, geo_x_var, level);
+                double *geo_x_3d = ld->data;
+
+                double *geo_y_3d = NULL;
+                if (need_geo_y && geo_y_var >= 0) {
+                    ld->data = NULL;
+                    read_variable_data_level(pf, geo_y_var, level);
+                    geo_y_3d = ld->data;
+                }
+
+                ld->data = saved_data;
+
+                if (!geo_x_3d) goto skip_map_overlay;
+
+                /* Extract 2D geo coordinate slices */
+                double *geo_x_slice = (double *)malloc(lwidth * lheight * sizeof(double));
+                double *geo_y_slice = (double *)malloc(lwidth * lheight * sizeof(double));
+
+                /* Extract x-axis geographic coordinates using temporary data swap */
+                ld->data = geo_x_3d;
+                extract_slice_level(ld, geo_x_slice, pf->slice_axis, level_slice_idx);
+
+                /* Extract or compute y-axis coordinates */
+                if (need_geo_y && geo_y_3d) {
+                    ld->data = geo_y_3d;
+                    extract_slice_level(ld, geo_y_slice, pf->slice_axis, level_slice_idx);
+                } else {
+                    /* Y-axis is physical Z coordinate */
+                    for (int lj = 0; lj < lheight; lj++) {
+                        double z_phys = pf->prob_lo[2] +
+                            (ld->level_lo[2] + lj + 0.5) * dx_level[2];
+                        for (int li = 0; li < lwidth; li++) {
+                            geo_y_slice[lj * lwidth + li] = z_phys;
+                        }
+                    }
+                }
+
+                ld->data = saved_data;
+
+                /* Compute slice_coord for box intersection test */
+                int map_slice_coord = level_slice_idx + ld->level_lo[pf->slice_axis];
+
+                /* Build in_box mask for this level */
+                unsigned char *map_in_box = (unsigned char *)calloc(lwidth * lheight, 1);
+                for (int bi = 0; bi < ld->n_boxes; bi++) {
+                    Box *box = &ld->boxes[bi];
+                    if (map_slice_coord < box->lo[pf->slice_axis] ||
+                        map_slice_coord > box->hi[pf->slice_axis])
+                        continue;
+                    int dim_x, dim_y;
+                    if (pf->slice_axis == 2) { dim_x = 0; dim_y = 1; }
+                    else if (pf->slice_axis == 1) { dim_x = 0; dim_y = 2; }
+                    else { dim_x = 1; dim_y = 2; }
+                    int mli_lo = box->lo[dim_x] - ld->level_lo[dim_x];
+                    int mli_hi = box->hi[dim_x] - ld->level_lo[dim_x];
+                    int mlj_lo = box->lo[dim_y] - ld->level_lo[dim_y];
+                    int mlj_hi = box->hi[dim_y] - ld->level_lo[dim_y];
+                    if (mli_lo < 0) mli_lo = 0;
+                    if (mlj_lo < 0) mlj_lo = 0;
+                    if (mli_hi >= lwidth) mli_hi = lwidth - 1;
+                    if (mlj_hi >= lheight) mlj_hi = lheight - 1;
+                    for (int mj = mlj_lo; mj <= mlj_hi; mj++)
+                        for (int mi = mli_lo; mi <= mli_hi; mi++)
+                            map_in_box[mj * lwidth + mi] = 1;
+                }
+
+                /* Extract data slice and apply colormap */
+                double *map_level_slice = (double *)malloc(lwidth * lheight * sizeof(double));
+                extract_slice_level(ld, map_level_slice, pf->slice_axis, level_slice_idx);
+                unsigned long *map_level_pixels = (unsigned long *)malloc(lwidth * lheight * sizeof(unsigned long));
+                apply_colormap(map_level_slice, lwidth, lheight, map_level_pixels, display_vmin, display_vmax, pf->colormap);
+
+                /* Render data points at geo coordinates (finer grid than base level) */
+                for (int lj = 0; lj < lheight; lj++) {
+                    for (int li = 0; li < lwidth; li++) {
+                        if (!map_in_box[lj * lwidth + li]) continue;
+                        int idx = lj * lwidth + li;
+                        double x_coord = geo_x_slice[idx];
+                        double y_coord = geo_y_slice[idx];
+                        if (x_coord >= phys_xmin && x_coord <= phys_xmax &&
+                            y_coord >= phys_ymin && y_coord <= phys_ymax) {
+                            int sx = offset_x + (int)((x_coord - phys_xmin) / (phys_xmax - phys_xmin) * local_render_width);
+                            int sy = offset_y + (int)((phys_ymax - y_coord) / (phys_ymax - phys_ymin) * local_render_height);
+                            XSetForeground(display, gc, map_level_pixels[idx]);
+                            XFillRectangle(display, canvas, gc, sx - 1, sy - 1, 3, 3);
+                        }
+                    }
+                }
+
+                /* Draw box boundaries as line segments following the geo coordinate grid */
+                XSetForeground(display, gc, 0xFF0000);  /* Red */
+                XSetLineAttributes(display, gc, 2, LineSolid, CapButt, JoinMiter);
+
+                for (int bi = 0; bi < ld->n_boxes; bi++) {
+                    Box *box = &ld->boxes[bi];
+                    if (map_slice_coord < box->lo[pf->slice_axis] ||
+                        map_slice_coord > box->hi[pf->slice_axis])
+                        continue;
+
+                    int dim_x, dim_y;
+                    if (pf->slice_axis == 2) { dim_x = 0; dim_y = 1; }
+                    else if (pf->slice_axis == 1) { dim_x = 0; dim_y = 2; }
+                    else { dim_x = 1; dim_y = 2; }
+
+                    int li_lo = box->lo[dim_x] - ld->level_lo[dim_x];
+                    int li_hi = box->hi[dim_x] - ld->level_lo[dim_x];
+                    int lj_lo = box->lo[dim_y] - ld->level_lo[dim_y];
+                    int lj_hi = box->hi[dim_y] - ld->level_lo[dim_y];
+
+                    /* Clamp to grid bounds */
+                    if (li_lo < 0) li_lo = 0;
+                    if (lj_lo < 0) lj_lo = 0;
+                    if (li_hi >= lwidth) li_hi = lwidth - 1;
+                    if (lj_hi >= lheight) lj_hi = lheight - 1;
+
+                    /* Bottom edge: j = lj_lo, i varies */
+                    for (int li = li_lo; li < li_hi; li++) {
+                        int idx0 = lj_lo * lwidth + li;
+                        int idx1 = lj_lo * lwidth + (li + 1);
+                        int sx0 = offset_x + (int)((geo_x_slice[idx0] - phys_xmin) / (phys_xmax - phys_xmin) * local_render_width);
+                        int sy0 = offset_y + (int)((phys_ymax - geo_y_slice[idx0]) / (phys_ymax - phys_ymin) * local_render_height);
+                        int sx1 = offset_x + (int)((geo_x_slice[idx1] - phys_xmin) / (phys_xmax - phys_xmin) * local_render_width);
+                        int sy1 = offset_y + (int)((phys_ymax - geo_y_slice[idx1]) / (phys_ymax - phys_ymin) * local_render_height);
+                        XDrawLine(display, canvas, gc, sx0, sy0, sx1, sy1);
+                    }
+
+                    /* Top edge: j = lj_hi, i varies */
+                    for (int li = li_lo; li < li_hi; li++) {
+                        int idx0 = lj_hi * lwidth + li;
+                        int idx1 = lj_hi * lwidth + (li + 1);
+                        int sx0 = offset_x + (int)((geo_x_slice[idx0] - phys_xmin) / (phys_xmax - phys_xmin) * local_render_width);
+                        int sy0 = offset_y + (int)((phys_ymax - geo_y_slice[idx0]) / (phys_ymax - phys_ymin) * local_render_height);
+                        int sx1 = offset_x + (int)((geo_x_slice[idx1] - phys_xmin) / (phys_xmax - phys_xmin) * local_render_width);
+                        int sy1 = offset_y + (int)((phys_ymax - geo_y_slice[idx1]) / (phys_ymax - phys_ymin) * local_render_height);
+                        XDrawLine(display, canvas, gc, sx0, sy0, sx1, sy1);
+                    }
+
+                    /* Left edge: i = li_lo, j varies */
+                    for (int lj = lj_lo; lj < lj_hi; lj++) {
+                        int idx0 = lj * lwidth + li_lo;
+                        int idx1 = (lj + 1) * lwidth + li_lo;
+                        int sx0 = offset_x + (int)((geo_x_slice[idx0] - phys_xmin) / (phys_xmax - phys_xmin) * local_render_width);
+                        int sy0 = offset_y + (int)((phys_ymax - geo_y_slice[idx0]) / (phys_ymax - phys_ymin) * local_render_height);
+                        int sx1 = offset_x + (int)((geo_x_slice[idx1] - phys_xmin) / (phys_xmax - phys_xmin) * local_render_width);
+                        int sy1 = offset_y + (int)((phys_ymax - geo_y_slice[idx1]) / (phys_ymax - phys_ymin) * local_render_height);
+                        XDrawLine(display, canvas, gc, sx0, sy0, sx1, sy1);
+                    }
+
+                    /* Right edge: i = li_hi, j varies */
+                    for (int lj = lj_lo; lj < lj_hi; lj++) {
+                        int idx0 = lj * lwidth + li_hi;
+                        int idx1 = (lj + 1) * lwidth + li_hi;
+                        int sx0 = offset_x + (int)((geo_x_slice[idx0] - phys_xmin) / (phys_xmax - phys_xmin) * local_render_width);
+                        int sy0 = offset_y + (int)((phys_ymax - geo_y_slice[idx0]) / (phys_ymax - phys_ymin) * local_render_height);
+                        int sx1 = offset_x + (int)((geo_x_slice[idx1] - phys_xmin) / (phys_xmax - phys_xmin) * local_render_width);
+                        int sy1 = offset_y + (int)((phys_ymax - geo_y_slice[idx1]) / (phys_ymax - phys_ymin) * local_render_height);
+                        XDrawLine(display, canvas, gc, sx0, sy0, sx1, sy1);
+                    }
+                }
+
+                XSetLineAttributes(display, gc, 0, LineSolid, CapButt, JoinMiter);
+
+                free(map_in_box);
+                free(map_level_slice);
+                free(map_level_pixels);
+                free(geo_x_slice);
+                free(geo_y_slice);
+                free(geo_x_3d);
+                if (geo_y_3d) free(geo_y_3d);
+
+                printf("Overlay level %d (map mode): rendered data + boundaries, slice %d\n",
+                       level, level_slice_idx);
+
+            skip_map_overlay:
+                continue;  /* Skip normal overlay rendering for this level */
+            }
+
             /* Extract slice from this level */
             double *level_slice = (double *)malloc(lwidth * lheight * sizeof(double));
             extract_slice_level(ld, level_slice, pf->slice_axis, level_slice_idx);
@@ -4201,43 +4562,69 @@ void render_slice(PlotfileData *pf) {
         }
     }
 
+    /* Reset clip region before drawing axes and labels */
+    if (zoom_level > 1.0) XSetClipMask(display, gc, None);
+
+    /* Use visible area coordinates for axis frame/labels */
+    int axis_ox = vis_area_x;
+    int axis_oy = vis_area_y;
+    int axis_w = vis_area_w;
+    int axis_h = vis_area_h;
+
+    /* Compute visible physical range when zoomed */
+    double vis_phys_xmin = phys_xmin, vis_phys_xmax = phys_xmax;
+    double vis_phys_ymin = phys_ymin, vis_phys_ymax = phys_ymax;
+    if (zoom_level > 1.0) {
+        int zoomed_rw = render_width;
+        int zoomed_rh = render_height;
+        double vis_frac_lo_x = (double)zoom_scroll_x / zoomed_rw;
+        double vis_frac_hi_x = (double)(zoom_scroll_x + vis_area_w) / zoomed_rw;
+        double vis_frac_lo_y = (double)zoom_scroll_y / zoomed_rh;
+        double vis_frac_hi_y = (double)(zoom_scroll_y + vis_area_h) / zoomed_rh;
+        vis_phys_xmin = phys_xmin + vis_frac_lo_x * (phys_xmax - phys_xmin);
+        vis_phys_xmax = phys_xmin + vis_frac_hi_x * (phys_xmax - phys_xmin);
+        /* Y is flipped: top of screen = high y, bottom = low y */
+        vis_phys_ymin = phys_ymin + (1.0 - vis_frac_hi_y) * (phys_ymax - phys_ymin);
+        vis_phys_ymax = phys_ymin + (1.0 - vis_frac_lo_y) * (phys_ymax - phys_ymin);
+    }
+
     /* Draw axis frame (border around data) */
     XSetForeground(display, text_gc, BlackPixel(display, screen));
-    XDrawRectangle(display, canvas, text_gc, offset_x, offset_y, local_render_width, local_render_height);
+    XDrawRectangle(display, canvas, text_gc, axis_ox, axis_oy, axis_w, axis_h);
 
     /* Draw X-axis ticks and labels */
     int n_xticks = 5;
     char label[32];
     for (i = 0; i <= n_xticks; i++) {
         double frac = (double)i / n_xticks;
-        int tick_x = offset_x + (int)(frac * local_render_width);
-        double phys_val = phys_xmin + frac * (phys_xmax - phys_xmin);
+        int tick_x = axis_ox + (int)(frac * axis_w);
+        double phys_val = vis_phys_xmin + frac * (vis_phys_xmax - vis_phys_xmin);
 
         /* Draw tick mark */
-        XDrawLine(display, canvas, text_gc, tick_x, offset_y + local_render_height,
-              tick_x, offset_y + local_render_height + 5);
+        XDrawLine(display, canvas, text_gc, tick_x, axis_oy + axis_h,
+              tick_x, axis_oy + axis_h + 5);
 
         /* Draw label */
         snprintf(label, sizeof(label), "%.3g", phys_val);
         int label_width = XTextWidth(font, label, strlen(label));
         XDrawString(display, canvas, text_gc, tick_x - label_width / 2,
-                offset_y + local_render_height + 18, label, strlen(label));
+                axis_oy + axis_h + 18, label, strlen(label));
     }
 
     /* Draw Y-axis ticks and labels */
     int n_yticks = 5;
     for (i = 0; i <= n_yticks; i++) {
         double frac = (double)i / n_yticks;
-        int tick_y = offset_y + local_render_height - (int)(frac * local_render_height);
-        double phys_val = phys_ymin + frac * (phys_ymax - phys_ymin);
+        int tick_y = axis_oy + axis_h - (int)(frac * axis_h);
+        double phys_val = vis_phys_ymin + frac * (vis_phys_ymax - vis_phys_ymin);
 
         /* Draw tick mark */
-        XDrawLine(display, canvas, text_gc, offset_x - 5, tick_y, offset_x, tick_y);
+        XDrawLine(display, canvas, text_gc, axis_ox - 5, tick_y, axis_ox, tick_y);
 
         /* Draw label */
         snprintf(label, sizeof(label), "%.3g", phys_val);
         int label_width = XTextWidth(font, label, strlen(label));
-        XDrawString(display, canvas, text_gc, offset_x - label_width - 8,
+        XDrawString(display, canvas, text_gc, axis_ox - label_width - 8,
                     tick_y + 4, label, strlen(label));
     }
 
@@ -4259,12 +4646,12 @@ void render_slice(PlotfileData *pf) {
     /* X-axis label (centered below ticks) */
     int xlabel_width = XTextWidth(font, x_label, strlen(x_label));
     XDrawString(display, canvas, text_gc,
-                offset_x + local_render_width / 2 - xlabel_width / 2,
-                offset_y + local_render_height + 35, x_label, strlen(x_label));
+                axis_ox + axis_w / 2 - xlabel_width / 2,
+                axis_oy + axis_h + 35, x_label, strlen(x_label));
 
     /* Y-axis label (rotated text is hard in X11, so just draw at left) */
     XDrawString(display, canvas, text_gc, 5,
-                offset_y + local_render_height / 2 + 4, y_label, strlen(y_label));
+                axis_oy + axis_h / 2 + 4, y_label, strlen(y_label));
 
     /* Draw text overlay - show display range (custom if set) */
     if (use_custom_range) {
@@ -4281,15 +4668,24 @@ void render_slice(PlotfileData *pf) {
     draw_colorbar(display_vmin, display_vmax, pf->colormap,
                   pf->variables[pf->current_var]);
 
+    /* Set clip region for quiver/map overlays when zoomed */
+    if (zoom_level > 1.0) {
+        XRectangle clip = {vis_area_x, vis_area_y, vis_area_w, vis_area_h};
+        XSetClipRectangles(display, gc, 0, 0, &clip, 1, Unsorted);
+    }
+
     /* Draw quiver overlay if enabled */
     if (quiver_data.enabled) {
         render_quiver_overlay(pf);
     }
-    
+
     /* Draw map overlay if in map mode */
     if (pf->map_mode) {
         render_map_overlay(pf, phys_xmin, phys_xmax, phys_ymin, phys_ymax);
     }
+
+    /* Reset clip after overlays */
+    if (zoom_level > 1.0) XSetClipMask(display, gc, None);
 
     XFlush(display);
     
@@ -4301,16 +4697,101 @@ void render_slice(PlotfileData *pf) {
     if (base_in_box) free(base_in_box);
 }
 
+/* Clamp zoom scroll offsets to valid range */
+void clamp_zoom_scroll(void) {
+    int zoomed_w = (int)(vis_area_w * zoom_level);
+    int zoomed_h = (int)(vis_area_h * zoom_level);
+    int max_sx = zoomed_w - vis_area_w;
+    int max_sy = zoomed_h - vis_area_h;
+    if (max_sx < 0) max_sx = 0;
+    if (max_sy < 0) max_sy = 0;
+    if (zoom_scroll_x > max_sx) zoom_scroll_x = max_sx;
+    if (zoom_scroll_y > max_sy) zoom_scroll_y = max_sy;
+    if (zoom_scroll_x < 0) zoom_scroll_x = 0;
+    if (zoom_scroll_y < 0) zoom_scroll_y = 0;
+}
+
+/* Reset zoom to 1.0 */
+void zoom_reset(void) {
+    zoom_level = 1.0;
+    zoom_scroll_x = 0;
+    zoom_scroll_y = 0;
+    zoom_dragging = 0;
+}
+
+/* Zoom in button callback */
+void zoom_in_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    if (!global_pf) return;
+    if (zoom_level >= 50.0) return;
+    double old_zoom = zoom_level;
+    zoom_level *= 1.5;
+    if (zoom_level > 50.0) zoom_level = 50.0;
+    /* Keep center of visible area centered */
+    double cx = (zoom_scroll_x + vis_area_w / 2.0) / (vis_area_w * old_zoom);
+    double cy = (zoom_scroll_y + vis_area_h / 2.0) / (vis_area_h * old_zoom);
+    zoom_scroll_x = (int)(cx * vis_area_w * zoom_level - vis_area_w / 2.0);
+    zoom_scroll_y = (int)(cy * vis_area_h * zoom_level - vis_area_h / 2.0);
+    clamp_zoom_scroll();
+    render_slice(global_pf);
+}
+
+/* Zoom out button callback */
+void zoom_out_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    if (!global_pf) return;
+    if (zoom_level <= 1.0) return;
+    double old_zoom = zoom_level;
+    zoom_level /= 1.5;
+    if (zoom_level < 1.0) zoom_level = 1.0;
+    /* Keep center of visible area centered */
+    double cx = (zoom_scroll_x + vis_area_w / 2.0) / (vis_area_w * old_zoom);
+    double cy = (zoom_scroll_y + vis_area_h / 2.0) / (vis_area_h * old_zoom);
+    zoom_scroll_x = (int)(cx * vis_area_w * zoom_level - vis_area_w / 2.0);
+    zoom_scroll_y = (int)(cy * vis_area_h * zoom_level - vis_area_h / 2.0);
+    clamp_zoom_scroll();
+    render_slice(global_pf);
+}
+
 /* Mouse motion handler - show value at cursor */
 void canvas_motion_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch) {
     if (!global_pf || !current_slice_data) return;
-    
+
     int mouse_x = event->xmotion.x;
     int mouse_y = event->xmotion.y;
-    
-    /* Convert mouse coordinates to data coordinates */
-    if (mouse_x < render_offset_x || mouse_x >= render_offset_x + render_width ||
-        mouse_y < render_offset_y || mouse_y >= render_offset_y + render_height) {
+
+    /* Handle drag / click detection */
+    if (zoom_dragging) {
+        /* Button released — detect click vs drag */
+        if (!(event->xmotion.state & Button1Mask)) {
+            int dx = mouse_x - zoom_drag_start_x;
+            int dy = mouse_y - zoom_drag_start_y;
+            zoom_dragging = 0;
+
+            /* Small movement = click: show line profiles */
+            if (abs(dx) < 5 && abs(dy) < 5) {
+                if (mouse_x >= vis_area_x && mouse_x < vis_area_x + vis_area_w &&
+                    mouse_y >= vis_area_y && mouse_y < vis_area_y + vis_area_h) {
+                    int data_x = (int)((mouse_x - render_offset_x) * slice_width / (double)render_width);
+                    int data_y = slice_height - 1 - (int)((mouse_y - render_offset_y) * slice_height / (double)render_height);
+                    if (data_x >= 0 && data_x < slice_width && data_y >= 0 && data_y < slice_height) {
+                        show_line_profiles(global_pf, data_x, data_y);
+                    }
+                }
+            }
+        } else if (zoom_level > 1.0) {
+            /* Button still held and zoomed: pan */
+            int dx = mouse_x - zoom_drag_start_x;
+            int dy = mouse_y - zoom_drag_start_y;
+            zoom_scroll_x = zoom_drag_scroll_x0 - dx;
+            zoom_scroll_y = zoom_drag_scroll_y0 - dy;
+            clamp_zoom_scroll();
+            render_slice(global_pf);
+            return;
+        }
+    }
+
+    /* Check if cursor is within visible data area */
+    if (mouse_x < vis_area_x || mouse_x >= vis_area_x + vis_area_w ||
+        mouse_y < vis_area_y || mouse_y >= vis_area_y + vis_area_h) {
         /* Outside data region - clear hover text */
         if (hover_value_text[0] != '\0') {
             hover_value_text[0] = '\0';
@@ -4318,14 +4799,15 @@ void canvas_motion_handler(Widget w, XtPointer client_data, XEvent *event, Boole
         }
         return;
     }
-    
+
+    /* Convert mouse coordinates to data coordinates using zoomed render params */
     int data_x = (int)((mouse_x - render_offset_x) * slice_width / (double)render_width);
     /* Flip y-axis for mouse coordinates to match flipped rendering */
     int data_y = slice_height - 1 - (int)((mouse_y - render_offset_y) * slice_height / (double)render_height);
-    
+
     if (data_x >= 0 && data_x < slice_width && data_y >= 0 && data_y < slice_height) {
         double value = current_slice_data[data_y * slice_width + data_x];
-        
+
         /* Update hover value text and info label */
         snprintf(hover_value_text, sizeof(hover_value_text), "[%d,%d]: %.6e", data_x, data_y, value);
         update_info_label(global_pf);
@@ -4342,23 +4824,69 @@ void canvas_button_handler(Widget w, XtPointer client_data, XEvent *event, Boole
     /* Set keyboard focus to canvas - needed for remote X11 forwarding */
     XSetInputFocus(display, canvas, RevertToParent, CurrentTime);
 
-    if (event->xbutton.button != Button1) return;
-    
     int mouse_x = event->xbutton.x;
     int mouse_y = event->xbutton.y;
-    
-    /* Convert mouse coordinates to data coordinates */
-    if (mouse_x < render_offset_x || mouse_x >= render_offset_x + render_width ||
-        mouse_y < render_offset_y || mouse_y >= render_offset_y + render_height) {
+
+    /* Mouse wheel zoom */
+    if (event->xbutton.button == Button4 || event->xbutton.button == Button5) {
+        /* Only zoom if cursor is within visible data area */
+        if (mouse_x < vis_area_x || mouse_x >= vis_area_x + vis_area_w ||
+            mouse_y < vis_area_y || mouse_y >= vis_area_y + vis_area_h) {
+            return;
+        }
+
+        double old_zoom = zoom_level;
+        double factor = (event->xbutton.button == Button4) ? 1.25 : (1.0 / 1.25);
+        double new_zoom = zoom_level * factor;
+        if (new_zoom < 1.0) new_zoom = 1.0;
+        if (new_zoom > 50.0) new_zoom = 50.0;
+        if (new_zoom == old_zoom) return;
+        zoom_level = new_zoom;
+
+        /* Adjust scroll so the point under cursor stays fixed */
+        double fx = (mouse_x - vis_area_x + zoom_scroll_x) / (vis_area_w * old_zoom);
+        double fy = (mouse_y - vis_area_y + zoom_scroll_y) / (vis_area_h * old_zoom);
+        zoom_scroll_x = (int)(fx * vis_area_w * zoom_level - (mouse_x - vis_area_x));
+        zoom_scroll_y = (int)(fy * vis_area_h * zoom_level - (mouse_y - vis_area_y));
+        clamp_zoom_scroll();
+        render_slice(global_pf);
         return;
     }
-    
-    int data_x = (int)((mouse_x - render_offset_x) * slice_width / (double)render_width);
-    /* Flip y-axis for mouse coordinates to match flipped rendering */
-    int data_y = slice_height - 1 - (int)((mouse_y - render_offset_y) * slice_height / (double)render_height);
-    
-    if (data_x >= 0 && data_x < slice_width && data_y >= 0 && data_y < slice_height) {
-        show_line_profiles(global_pf, data_x, data_y);
+
+    if (event->xbutton.button != Button1) return;
+
+    /* Always record drag start (used for both zoomed drag-pan and click detection) */
+    zoom_dragging = 1;
+    zoom_drag_start_x = mouse_x;
+    zoom_drag_start_y = mouse_y;
+    zoom_drag_scroll_x0 = zoom_scroll_x;
+    zoom_drag_scroll_y0 = zoom_scroll_y;
+}
+
+/* Mouse button release handler - end drag pan, detect click */
+void canvas_button_release_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch) {
+    if (!global_pf || event->xbutton.button != Button1) return;
+    if (event->xbutton.window != canvas) return;
+
+    if (zoom_dragging) {
+        int mouse_x = event->xbutton.x;
+        int mouse_y = event->xbutton.y;
+        int dx = mouse_x - zoom_drag_start_x;
+        int dy = mouse_y - zoom_drag_start_y;
+        zoom_dragging = 0;
+
+        /* If barely moved, treat as click for line profile */
+        if (abs(dx) < 5 && abs(dy) < 5) {
+            if (mouse_x < vis_area_x || mouse_x >= vis_area_x + vis_area_w ||
+                mouse_y < vis_area_y || mouse_y >= vis_area_y + vis_area_h) {
+                return;
+            }
+            int data_x = (int)((mouse_x - render_offset_x) * slice_width / (double)render_width);
+            int data_y = slice_height - 1 - (int)((mouse_y - render_offset_y) * slice_height / (double)render_height);
+            if (data_x >= 0 && data_x < slice_width && data_y >= 0 && data_y < slice_height) {
+                show_line_profiles(global_pf, data_x, data_y);
+            }
+        }
     }
 }
 
@@ -6384,6 +6912,12 @@ void render_map_overlay(PlotfileData *pf, double lon_min, double lon_max, double
     if (map_color_pixel == 0) update_map_color_pixel();
     XSetForeground(display, coastline_gc, map_color_pixel);
     XSetLineAttributes(display, coastline_gc, 3, LineSolid, CapButt, JoinMiter);  /* Thick line for visibility */
+
+    /* Apply zoom clip to coastline GC */
+    if (zoom_level > 1.0) {
+        XRectangle clip = {vis_area_x, vis_area_y, vis_area_w, vis_area_h};
+        XSetClipRectangles(display, coastline_gc, 0, 0, &clip, 1, Unsorted);
+    }
     
     if (!map_coastlines_enabled) {
         XFreeGC(display, coastline_gc);
@@ -7679,6 +8213,12 @@ int main(int argc, char **argv) {
                 if (new_timestep < 0) new_timestep = n_timesteps - 1;
                 switch_timestep(global_pf, new_timestep);
                 continue;  /* switch_timestep handles all updates */
+            } else if (key == XK_r || key == XK_0) {
+                /* Reset zoom */
+                if (zoom_level > 1.0) {
+                    zoom_reset();
+                    changed = 1;
+                }
             }
 
             if (changed) {

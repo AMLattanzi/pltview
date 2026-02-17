@@ -1,6 +1,16 @@
 Changelog
 =========
 
+v0.4.0
+------
+- Zoom and pan: mouse wheel zoom centered on cursor, Z+/Z- buttons, drag-to-pan when zoomed
+- Axis labels update to show visible sub-range when zoomed
+- Keyboard shortcut: 'r' or '0' to reset zoom
+- Zoom resets automatically on variable, axis, level, or timestep change
+- Map mode: dot size scales with zoom level for continuous coverage
+- Map mode overlay: higher AMR levels now render data (not just boundaries) in map mode
+- Click-to-profile works at all zoom levels (click = profile, drag = pan)
+
 v0.3.7
 ------
 - Fix crash when rendering large grids by resizing the pixel buffer
