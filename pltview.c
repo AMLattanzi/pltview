@@ -145,13 +145,14 @@ typedef struct {
 /* X11 globals */
 Display *display;
 Widget toplevel, form, canvas_widget, var_box, info_label;
-Widget var_panel, var_viewport, var_scrollbar;
+Widget var_viewport, var_scrollbar;
 Widget axis_box, nav_box, colorbar_widget, layer_label;
 Window canvas, colorbar;
 GC gc, text_gc, colorbar_gc;
 XImage *ximage;
 int screen;
 unsigned long *pixel_data;
+size_t pixel_data_size = 0;
 int canvas_width = 800;
 int canvas_height = 600;
 Pixmap pixmap, colorbar_pixmap;
@@ -2160,19 +2161,9 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     XtSetArg(args[n], XtNright, XawChainRight); n++;
     info_label = XtCreateManagedWidget("info", labelWidgetClass, form, args, n);
     
-    /* Variable panel (scrollbar + viewport) */
-    n = 0;
-    XtSetArg(args[n], XtNfromVert, info_label); n++;
-    XtSetArg(args[n], XtNborderWidth, 1); n++;
-    XtSetArg(args[n], XtNtop, XawChainTop); n++;
-    XtSetArg(args[n], XtNbottom, XawChainBottom); n++;
-    XtSetArg(args[n], XtNleft, XawChainLeft); n++;
-    XtSetArg(args[n], XtNheight, canvas_height); n++;
-    XtSetArg(args[n], XtNwidth, 200); n++;
-    var_panel = XtCreateManagedWidget("varPanel", formWidgetClass, form, args, n);
-
     /* Variable buttons viewport (use internal scrollbar) */
     n = 0;
+    XtSetArg(args[n], XtNfromVert, info_label); n++;
     XtSetArg(args[n], XtNborderWidth, 0); n++;
     XtSetArg(args[n], XtNtop, XawChainTop); n++;
     XtSetArg(args[n], XtNbottom, XawChainBottom); n++;
@@ -2181,8 +2172,8 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     XtSetArg(args[n], XtNallowHoriz, False); n++;
     XtSetArg(args[n], XtNforceBars, True); n++;
     XtSetArg(args[n], XtNheight, canvas_height); n++;
-    XtSetArg(args[n], XtNwidth, 180); n++;
-    var_viewport = XtCreateManagedWidget("varViewport", viewportWidgetClass, var_panel, args, n);
+    XtSetArg(args[n], XtNwidth, 200); n++;
+    var_viewport = XtCreateManagedWidget("varViewport", viewportWidgetClass, form, args, n);
     XtAddEventHandler(var_viewport, ButtonPressMask, False, var_viewport_wheel_handler, NULL);
     XtAddEventHandler(var_viewport, StructureNotifyMask, False, var_viewport_configure_handler, NULL);
 
@@ -2203,7 +2194,7 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     /* Canvas drawing area */
     n = 0;
     XtSetArg(args[n], XtNfromVert, info_label); n++;
-    XtSetArg(args[n], XtNfromHoriz, var_panel); n++;
+    XtSetArg(args[n], XtNfromHoriz, var_viewport); n++;
     XtSetArg(args[n], XtNwidth, canvas_width); n++;
     XtSetArg(args[n], XtNheight, canvas_height); n++;
     XtSetArg(args[n], XtNborderWidth, 2); n++;
@@ -2218,7 +2209,7 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     /* Navigation buttons (+/-) in Column 1, Row 1 */
     n = 0;
     XtSetArg(args[n], XtNfromVert, canvas_widget); n++;
-    XtSetArg(args[n], XtNfromHoriz, var_panel); n++;
+    XtSetArg(args[n], XtNfromHoriz, var_viewport); n++;
     XtSetArg(args[n], XtNborderWidth, 1); n++;
     XtSetArg(args[n], XtNorientation, XtorientHorizontal); n++;
     XtSetArg(args[n], XtNbottom, XawChainBottom); n++;
@@ -2356,7 +2347,7 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
         Widget time_box;
         n = 0;
         XtSetArg(args[n], XtNfromVert, nav_box); n++;
-        XtSetArg(args[n], XtNfromHoriz, var_panel); n++;
+        XtSetArg(args[n], XtNfromHoriz, var_viewport); n++;
         XtSetArg(args[n], XtNborderWidth, 1); n++;
         XtSetArg(args[n], XtNorientation, XtorientHorizontal); n++;
         XtSetArg(args[n], XtNbottom, XawChainBottom); n++;
@@ -2432,7 +2423,8 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     if (font) XSetFont(display, text_gc, font->fid);
     
     /* Allocate pixel buffer */
-    pixel_data = (unsigned long *)malloc(canvas_width * canvas_height * sizeof(unsigned long));
+    pixel_data_size = (size_t)canvas_width * (size_t)canvas_height;
+    pixel_data = (unsigned long *)malloc(pixel_data_size * sizeof(unsigned long));
     pixmap = XCreatePixmap(display, canvas, canvas_width, canvas_height, 
                           DefaultDepth(display, screen));
     colorbar_pixmap = XCreatePixmap(display, colorbar, 100, 256,
@@ -3553,6 +3545,16 @@ void render_slice(PlotfileData *pf) {
     }
 
     slice = (double *)malloc(width * height * sizeof(double));
+    {
+        size_t needed_pixels = (size_t)width * (size_t)height;
+        if (needed_pixels > pixel_data_size) {
+            unsigned long *new_pixels = (unsigned long *)realloc(pixel_data, needed_pixels * sizeof(unsigned long));
+            if (new_pixels) {
+                pixel_data = new_pixels;
+                pixel_data_size = needed_pixels;
+            }
+        }
+    }
     extract_slice(pf, slice, pf->slice_axis, pf->slice_idx);
 
     /* Physical coordinate ranges for axes */
@@ -6698,6 +6700,7 @@ void show_time_series(PlotfileData *pf) {
 void cleanup(PlotfileData *pf) {
     if (pf->data) free(pf->data);
     if (pixel_data) free(pixel_data);
+    pixel_data_size = 0;
     if (current_slice_data) free(current_slice_data);
 }
 

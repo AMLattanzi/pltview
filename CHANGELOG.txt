@@ -1,6 +1,10 @@
 Changelog
 =========
 
+v0.3.7
+------
+- Fix crash when rendering large grids by resizing the pixel buffer
+
 v0.3.6
 ------
 - Use a single scrollbar for the variable list
