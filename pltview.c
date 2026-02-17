@@ -8,6 +8,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <dirent.h>
+#include <sys/types.h>
 #include <sys/stat.h>
 #include <math.h>
 #include <X11/Xlib.h>
@@ -26,6 +27,7 @@
 #include <X11/Xaw/Simple.h>
 #include <X11/Xaw/Dialog.h>
 #include <X11/Xaw/AsciiText.h>
+#include <X11/Xaw/Viewport.h>
 
 #define MAX_VARS 128
 #define MAX_BOXES 1024
@@ -39,6 +41,7 @@ typedef struct {
     int lo[3];
     int hi[3];
     char filename[64];
+    long long offset;
 } Box;
 
 /* Per-level data storage for multi-level overlay rendering */
@@ -142,6 +145,7 @@ typedef struct {
 /* X11 globals */
 Display *display;
 Widget toplevel, form, canvas_widget, var_box, info_label;
+Widget var_panel, var_viewport, var_scrollbar;
 Widget axis_box, nav_box, colorbar_widget, layer_label;
 Window canvas, colorbar;
 GC gc, text_gc, colorbar_gc;
@@ -328,6 +332,10 @@ void sdm_logy_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void sdm_settings_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void sdm_settings_apply_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void sdm_settings_close_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void var_viewport_wheel_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch);
+void var_scrollbar_scroll_proc(Widget w, XtPointer client_data, XtPointer call_data);
+void var_scrollbar_jump_proc(Widget w, XtPointer client_data, XtPointer call_data);
+void var_viewport_configure_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch);
 
 /* Global pointer for callbacks */
 PlotfileData *global_pf = NULL;
@@ -361,6 +369,148 @@ typedef struct {
 } VarSelectData;
 
 VarSelectData var_select_data = {NULL, NULL, NULL, 0, NULL, 0};
+
+/* Normalize dimensions for 2D plotfiles */
+static void normalize_plotfile_dims(PlotfileData *pf) {
+    int i;
+    for (i = pf->ndim; i < 3; i++) {
+        pf->grid_dims[i] = 1;
+        pf->level_lo[i] = 0;
+        pf->level_hi[i] = 0;
+    }
+}
+
+static void normalize_level_dims(PlotfileData *pf, LevelData *ld) {
+    int i;
+    for (i = pf->ndim; i < 3; i++) {
+        ld->grid_dims[i] = 1;
+        ld->level_lo[i] = 0;
+        ld->level_hi[i] = 0;
+    }
+}
+
+static void update_var_scrollbar(void) {
+    if (!var_viewport || !var_scrollbar) return;
+
+    Widget child = NULL;
+    WidgetList children = NULL;
+    Cardinal num_children = 0;
+    Dimension viewport_height = 0, child_height = 0;
+    Position child_y = 0;
+
+    XtVaGetValues(var_viewport,
+                  XtNchildren, &children,
+                  XtNnumChildren, &num_children,
+                  XtNheight, &viewport_height,
+                  NULL);
+    if (!children || num_children == 0) return;
+    child = children[0];
+    XtVaGetValues(child, XtNy, &child_y, XtNheight, &child_height, NULL);
+
+    if (child_height <= viewport_height || viewport_height == 0) {
+        XawScrollbarSetThumb(var_scrollbar, 0.0f, 1.0f);
+        return;
+    }
+
+    float shown = (float)viewport_height / (float)child_height;
+    float top = (float)(-child_y) / (float)(child_height - viewport_height);
+    if (top < 0.0f) top = 0.0f;
+    if (top > 1.0f) top = 1.0f;
+    XawScrollbarSetThumb(var_scrollbar, top, shown);
+}
+
+/* Mouse wheel handler for variable viewport scrolling */
+void var_viewport_wheel_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch) {
+    if (event->type != ButtonPress) return;
+    XButtonEvent *bev = (XButtonEvent *)event;
+    if (bev->button != Button4 && bev->button != Button5) return;
+
+    Widget child = NULL;
+    WidgetList children = NULL;
+    Cardinal num_children = 0;
+    Dimension viewport_height = 0, child_height = 0;
+    Position child_y = 0;
+
+    XtVaGetValues(w,
+                  XtNchildren, &children,
+                  XtNnumChildren, &num_children,
+                  XtNheight, &viewport_height,
+                  NULL);
+    if (!children || num_children == 0) return;
+    child = children[0];
+    XtVaGetValues(child, XtNy, &child_y, XtNheight, &child_height, NULL);
+
+    int scroll = (bev->button == Button4) ? -40 : 40;
+    int current_y = (int)(-child_y);
+    int new_y = current_y + scroll;
+    int max_y = (child_height > viewport_height) ? (int)(child_height - viewport_height) : 0;
+
+    if (new_y < 0) new_y = 0;
+    if (new_y > max_y) new_y = max_y;
+
+    XawViewportSetCoordinates(w, 0, new_y);
+    update_var_scrollbar();
+    if (continue_dispatch) *continue_dispatch = False;
+}
+
+void var_scrollbar_scroll_proc(Widget w, XtPointer client_data, XtPointer call_data) {
+    int delta = (int)(long)call_data;
+    Widget child = NULL;
+    WidgetList children = NULL;
+    Cardinal num_children = 0;
+    Dimension viewport_height = 0, child_height = 0;
+    Position child_y = 0;
+
+    XtVaGetValues(var_viewport,
+                  XtNchildren, &children,
+                  XtNnumChildren, &num_children,
+                  XtNheight, &viewport_height,
+                  NULL);
+    if (!children || num_children == 0) return;
+    child = children[0];
+    XtVaGetValues(child, XtNy, &child_y, XtNheight, &child_height, NULL);
+
+    int current_y = (int)(-child_y);
+    int new_y = current_y + delta;
+    int max_y = (child_height > viewport_height) ? (int)(child_height - viewport_height) : 0;
+
+    if (new_y < 0) new_y = 0;
+    if (new_y > max_y) new_y = max_y;
+
+    XawViewportSetCoordinates(var_viewport, 0, new_y);
+    update_var_scrollbar();
+}
+
+void var_scrollbar_jump_proc(Widget w, XtPointer client_data, XtPointer call_data) {
+    float top = *(float *)call_data;
+    Widget child = NULL;
+    WidgetList children = NULL;
+    Cardinal num_children = 0;
+    Dimension viewport_height = 0, child_height = 0;
+
+    XtVaGetValues(var_viewport,
+                  XtNchildren, &children,
+                  XtNnumChildren, &num_children,
+                  XtNheight, &viewport_height,
+                  NULL);
+    if (!children || num_children == 0) return;
+    child = children[0];
+    XtVaGetValues(child, XtNheight, &child_height, NULL);
+
+    int max_y = (child_height > viewport_height) ? (int)(child_height - viewport_height) : 0;
+    int new_y = (int)(top * max_y + 0.5f);
+    if (new_y < 0) new_y = 0;
+    if (new_y > max_y) new_y = max_y;
+
+    XawViewportSetCoordinates(var_viewport, 0, new_y);
+    update_var_scrollbar();
+}
+
+void var_viewport_configure_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch) {
+    if (event->type == ConfigureNotify) {
+        update_var_scrollbar();
+    }
+}
 
 
 /* Detect number of levels by scanning for Level_X directories */
@@ -962,10 +1112,8 @@ int read_header(PlotfileData *pf) {
     for (i = 0; i < pf->ndim; i++) {
         pf->grid_dims[i] = hi[i] - lo[i] + 1;
     }
-    /* For 2D data, ensure the unused dimension is 1 (not 0) */
-    for (i = pf->ndim; i < 3; i++) {
-        pf->grid_dims[i] = 1;
-    }
+    /* Ensure non-zero dimensions for 2D plotfiles */
+    normalize_plotfile_dims(pf);
     
     fclose(fp);
     
@@ -1007,6 +1155,7 @@ int read_cell_h(PlotfileData *pf) {
     int level_lo[3] = {0, 0, 0};
     int level_hi[3] = {0, 0, 0};
     int found_domain = 0;
+    pf->n_boxes = 0;
     
     /* Skip first few lines until we find box definitions */
     int box_count = 0;
@@ -1044,16 +1193,27 @@ int read_cell_h(PlotfileData *pf) {
             
             box_count++;
         } else if (strncmp(line, "FabOnDisk:", 10) == 0) {
-            /* Parse FabOnDisk: Cell_D_XXXXX */
+            /* Parse FabOnDisk: Cell_D_XXXXX offset */
             char *p = strchr(line, ':');
             if (p) {
                 p++;
                 while (*p == ' ') p++;
                 char *end = strchr(p, ' ');
-                if (end) *end = '\0';
-                end = strchr(p, '\n');
-                if (end) *end = '\0';
+                if (end) {
+                    *end = '\0';
+                    end++;
+                }
+                char *line_end = strchr(p, '\n');
+                if (line_end) *line_end = '\0';
                 strncpy(pf->boxes[pf->n_boxes].filename, p, 63);
+                pf->boxes[pf->n_boxes].filename[63] = '\0';
+                pf->boxes[pf->n_boxes].offset = 0;
+                if (end) {
+                    while (*end == ' ') end++;
+                    if (*end) {
+                        pf->boxes[pf->n_boxes].offset = strtoll(end, NULL, 10);
+                    }
+                }
                 pf->n_boxes++;
             }
         }
@@ -1067,12 +1227,8 @@ int read_cell_h(PlotfileData *pf) {
         pf->level_hi[i] = level_hi[i];
         pf->grid_dims[i] = level_hi[i] - level_lo[i] + 1;
     }
-    /* Initialize any remaining dimensions for 2D cases */
-    for (i = pf->ndim; i < 3; i++) {
-        pf->level_lo[i] = 0;
-        pf->level_hi[i] = 0;
-        pf->grid_dims[i] = 1;
-    }
+    /* Ensure non-zero dimensions for 2D plotfiles */
+    normalize_plotfile_dims(pf);
 
     printf("Level %d: Found %d boxes, Grid: %d x %d x %d (lo: %d,%d,%d)\n",
            pf->current_level, pf->n_boxes,
@@ -1105,12 +1261,17 @@ int read_variable_data(PlotfileData *pf, int var_idx) {
         fp = fopen(path, "rb");
         if (!fp) continue;
         
+        /* Seek to FAB header offset if provided */
+        if (box->offset > 0) {
+            fseeko(fp, (off_t)box->offset, SEEK_SET);
+        }
+
         /* Skip FAB header (read until newline) */
         int c;
         while ((c = fgetc(fp)) != EOF && c != '\n');
-        
+
         /* Skip to variable data */
-        fseek(fp, var_idx * box_size * sizeof(double), SEEK_CUR);
+        fseeko(fp, (off_t)(var_idx * box_size * sizeof(double)), SEEK_CUR);
         
         /* Read box data */
         double *box_data = (double *)malloc(box_size * sizeof(double));
@@ -1200,16 +1361,27 @@ int read_cell_h_level(PlotfileData *pf, int level) {
             }
             box_count++;
         } else if (strncmp(line, "FabOnDisk:", 10) == 0) {
-            /* Parse FabOnDisk: Cell_D_XXXXX */
+            /* Parse FabOnDisk: Cell_D_XXXXX offset */
             char *p = strchr(line, ':');
             if (p) {
                 p++;
                 while (*p == ' ') p++;
                 char *end = strchr(p, ' ');
-                if (end) *end = '\0';
-                end = strchr(p, '\n');
-                if (end) *end = '\0';
+                if (end) {
+                    *end = '\0';
+                    end++;
+                }
+                char *line_end = strchr(p, '\n');
+                if (line_end) *line_end = '\0';
                 strncpy(ld->boxes[ld->n_boxes].filename, p, 63);
+                ld->boxes[ld->n_boxes].filename[63] = '\0';
+                ld->boxes[ld->n_boxes].offset = 0;
+                if (end) {
+                    while (*end == ' ') end++;
+                    if (*end) {
+                        ld->boxes[ld->n_boxes].offset = strtoll(end, NULL, 10);
+                    }
+                }
                 ld->n_boxes++;
             }
         }
@@ -1223,11 +1395,7 @@ int read_cell_h_level(PlotfileData *pf, int level) {
         ld->level_hi[i] = level_hi[i];
         ld->grid_dims[i] = level_hi[i] - level_lo[i] + 1;
     }
-    for (i = pf->ndim; i < 3; i++) {
-        ld->level_lo[i] = 0;
-        ld->level_hi[i] = 0;
-        ld->grid_dims[i] = 1;
-    }
+    normalize_level_dims(pf, ld);
 
     printf("Level %d overlay: Found %d boxes, Grid: %d x %d x %d (lo: %d,%d,%d)\n",
            level, ld->n_boxes,
@@ -1266,12 +1434,17 @@ int read_variable_data_level(PlotfileData *pf, int var_idx, int level) {
         fp = fopen(path, "rb");
         if (!fp) continue;
 
+        /* Seek to FAB header offset if provided */
+        if (box->offset > 0) {
+            fseeko(fp, (off_t)box->offset, SEEK_SET);
+        }
+
         /* Skip FAB header */
         int c;
         while ((c = fgetc(fp)) != EOF && c != '\n');
 
         /* Skip to variable data */
-        fseek(fp, var_idx * box_size * sizeof(double), SEEK_CUR);
+        fseeko(fp, (off_t)(var_idx * box_size * sizeof(double)), SEEK_CUR);
 
         /* Read box data */
         double *box_data = (double *)malloc(box_size * sizeof(double));
@@ -1987,15 +2160,49 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     XtSetArg(args[n], XtNright, XawChainRight); n++;
     info_label = XtCreateManagedWidget("info", labelWidgetClass, form, args, n);
     
-    /* Variable buttons box */
+    /* Variable panel (scrollbar + viewport) */
     n = 0;
     XtSetArg(args[n], XtNfromVert, info_label); n++;
     XtSetArg(args[n], XtNborderWidth, 1); n++;
+    XtSetArg(args[n], XtNtop, XawChainTop); n++;
+    XtSetArg(args[n], XtNbottom, XawChainBottom); n++;
+    XtSetArg(args[n], XtNleft, XawChainLeft); n++;
+    XtSetArg(args[n], XtNheight, canvas_height); n++;
+    XtSetArg(args[n], XtNwidth, 200); n++;
+    var_panel = XtCreateManagedWidget("varPanel", formWidgetClass, form, args, n);
+
+    /* Vertical scrollbar for variables */
+    n = 0;
     XtSetArg(args[n], XtNorientation, XtorientVertical); n++;
     XtSetArg(args[n], XtNtop, XawChainTop); n++;
     XtSetArg(args[n], XtNbottom, XawChainBottom); n++;
     XtSetArg(args[n], XtNleft, XawChainLeft); n++;
-    var_box = XtCreateManagedWidget("varBox", boxWidgetClass, form, args, n);
+    XtSetArg(args[n], XtNheight, canvas_height); n++;
+    XtSetArg(args[n], XtNwidth, 14); n++;
+    var_scrollbar = XtCreateManagedWidget("varScrollbar", scrollbarWidgetClass, var_panel, args, n);
+    XtAddCallback(var_scrollbar, XtNscrollProc, var_scrollbar_scroll_proc, NULL);
+    XtAddCallback(var_scrollbar, XtNjumpProc, var_scrollbar_jump_proc, NULL);
+
+    /* Variable buttons viewport (no internal scrollbars) */
+    n = 0;
+    XtSetArg(args[n], XtNfromHoriz, var_scrollbar); n++;
+    XtSetArg(args[n], XtNborderWidth, 0); n++;
+    XtSetArg(args[n], XtNtop, XawChainTop); n++;
+    XtSetArg(args[n], XtNbottom, XawChainBottom); n++;
+    XtSetArg(args[n], XtNleft, XawChainLeft); n++;
+    XtSetArg(args[n], XtNallowVert, False); n++;
+    XtSetArg(args[n], XtNallowHoriz, False); n++;
+    XtSetArg(args[n], XtNforceBars, False); n++;
+    XtSetArg(args[n], XtNheight, canvas_height); n++;
+    XtSetArg(args[n], XtNwidth, 180); n++;
+    var_viewport = XtCreateManagedWidget("varViewport", viewportWidgetClass, var_panel, args, n);
+    XtAddEventHandler(var_viewport, ButtonPressMask, False, var_viewport_wheel_handler, NULL);
+    XtAddEventHandler(var_viewport, StructureNotifyMask, False, var_viewport_configure_handler, NULL);
+
+    /* Variable buttons box inside viewport */
+    n = 0;
+    XtSetArg(args[n], XtNorientation, XtorientVertical); n++;
+    var_box = XtCreateManagedWidget("varBox", boxWidgetClass, var_viewport, args, n);
     
     /* Add variable buttons (all available variables) */
     for (i = 0; i < pf->n_vars; i++) {
@@ -2004,11 +2211,12 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
         button = XtCreateManagedWidget(pf->variables[i], commandWidgetClass, var_box, args, n);
         XtAddCallback(button, XtNcallback, var_button_callback, (XtPointer)(long)i);
     }
+    update_var_scrollbar();
     
     /* Canvas drawing area */
     n = 0;
     XtSetArg(args[n], XtNfromVert, info_label); n++;
-    XtSetArg(args[n], XtNfromHoriz, var_box); n++;
+    XtSetArg(args[n], XtNfromHoriz, var_panel); n++;
     XtSetArg(args[n], XtNwidth, canvas_width); n++;
     XtSetArg(args[n], XtNheight, canvas_height); n++;
     XtSetArg(args[n], XtNborderWidth, 2); n++;
@@ -2023,7 +2231,7 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     /* Navigation buttons (+/-) in Column 1, Row 1 */
     n = 0;
     XtSetArg(args[n], XtNfromVert, canvas_widget); n++;
-    XtSetArg(args[n], XtNfromHoriz, var_box); n++;
+    XtSetArg(args[n], XtNfromHoriz, var_panel); n++;
     XtSetArg(args[n], XtNborderWidth, 1); n++;
     XtSetArg(args[n], XtNorientation, XtorientHorizontal); n++;
     XtSetArg(args[n], XtNbottom, XawChainBottom); n++;
@@ -2161,7 +2369,7 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
         Widget time_box;
         n = 0;
         XtSetArg(args[n], XtNfromVert, nav_box); n++;
-        XtSetArg(args[n], XtNfromHoriz, var_box); n++;
+        XtSetArg(args[n], XtNfromHoriz, var_panel); n++;
         XtSetArg(args[n], XtNborderWidth, 1); n++;
         XtSetArg(args[n], XtNorientation, XtorientHorizontal); n++;
         XtSetArg(args[n], XtNbottom, XawChainBottom); n++;
