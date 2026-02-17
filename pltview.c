@@ -2574,7 +2574,7 @@ void map_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
         
         if (lon_idx >= 0 && lat_idx >= 0) {
             if (!map_layers_available) {
-                show_map_unavailable_dialog("Map layers not installed. Reinstall with --map.");
+                show_map_unavailable_dialog("Map layers not installed. To enable Map function, include `PLTVIEW_WITH_MAP=1` before pip install or upgrade.");
                 return;
             }
             /* Toggle map mode */
@@ -2828,10 +2828,10 @@ void map_remove_callback(Widget w, XtPointer client_data, XtPointer call_data) {
     (void)client_data;
     (void)call_data;
     if (!global_pf) return;
-    map_coastlines_enabled = 0;
-    for (int i = 0; i < n_coastlines; i++) {
-        coastlines[i].enabled = 0;
-        update_coastline_button_label(&coastlines[i]);
+    global_pf->map_mode = 0;
+    XtVaSetValues(map_button_widget, XtNlabel, "Map: OFF", NULL);
+    if (map_dialog_shell) {
+        XtPopdown(map_dialog_shell);
     }
     update_info_label(global_pf);
     render_slice(global_pf);
@@ -3588,6 +3588,77 @@ void colorbar_expose_callback(Widget w, XtPointer client_data, XtPointer call_da
         draw_colorbar(current_vmin, current_vmax, global_pf->colormap,
                       global_pf->variables[global_pf->current_var]);
     }
+}
+
+static void draw_y_label_ccw(const char *label, int x, int y_center) {
+    if (!label || !label[0] || !font) return;
+
+    int len = (int)strlen(label);
+    int text_w = XTextWidth(font, label, len);
+    int text_h = font->ascent + font->descent;
+    if (text_w <= 0 || text_h <= 0) return;
+
+    Pixmap tmp = XCreatePixmap(display, canvas, text_w, text_h,
+                               DefaultDepth(display, screen));
+    if (!tmp) return;
+
+    GC tmp_gc = XCreateGC(display, tmp, 0, NULL);
+    if (!tmp_gc) {
+        XFreePixmap(display, tmp);
+        return;
+    }
+
+    XSetForeground(display, tmp_gc, WhitePixel(display, screen));
+    XFillRectangle(display, tmp, tmp_gc, 0, 0, text_w, text_h);
+    XSetForeground(display, tmp_gc, BlackPixel(display, screen));
+    if (font) {
+        XSetFont(display, tmp_gc, font->fid);
+    }
+    XDrawString(display, tmp, tmp_gc, 0, font->ascent, label, len);
+
+    XImage *src = XGetImage(display, tmp, 0, 0, text_w, text_h, AllPlanes, ZPixmap);
+    if (!src) {
+        XFreeGC(display, tmp_gc);
+        XFreePixmap(display, tmp);
+        return;
+    }
+
+    int dest_w = text_h;
+    int dest_h = text_w;
+    XImage *rot = XCreateImage(display, DefaultVisual(display, screen),
+                               DefaultDepth(display, screen), ZPixmap, 0, NULL,
+                               dest_w, dest_h, 32, 0);
+    if (!rot) {
+        XDestroyImage(src);
+        XFreeGC(display, tmp_gc);
+        XFreePixmap(display, tmp);
+        return;
+    }
+    rot->data = (char *)malloc((size_t)rot->bytes_per_line * (size_t)dest_h);
+    if (!rot->data) {
+        XDestroyImage(rot);
+        XDestroyImage(src);
+        XFreeGC(display, tmp_gc);
+        XFreePixmap(display, tmp);
+        return;
+    }
+
+    for (int y = 0; y < text_h; y++) {
+        for (int xx = 0; xx < text_w; xx++) {
+            unsigned long pixel = XGetPixel(src, xx, y);
+            int rx = y;
+            int ry = dest_h - 1 - xx;
+            XPutPixel(rot, rx, ry, pixel);
+        }
+    }
+
+    int draw_y = y_center - dest_h / 2;
+    XPutImage(display, canvas, text_gc, rot, 0, 0, x, draw_y, dest_w, dest_h);
+
+    XDestroyImage(rot);
+    XDestroyImage(src);
+    XFreeGC(display, tmp_gc);
+    XFreePixmap(display, tmp);
 }
 void render_slice(PlotfileData *pf) {
     int width, height;
@@ -4694,9 +4765,9 @@ void render_slice(PlotfileData *pf) {
                 axis_ox + axis_w / 2 - xlabel_width / 2,
                 axis_oy + axis_h + 35, x_label, strlen(x_label));
 
-    /* Y-axis label (rotated text is hard in X11, so just draw at left) */
-    XDrawString(display, canvas, text_gc, 5,
-                axis_oy + axis_h / 2 + 4, y_label, strlen(y_label));
+    /* Y-axis label (rotated 90° CCW) */
+    int y_label_x = axis_ox - left_margin;
+    draw_y_label_ccw(y_label, y_label_x, axis_oy + axis_h / 2);
 
     /* Draw text overlay - show display range (custom if set) */
     if (use_custom_range) {

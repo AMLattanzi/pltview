@@ -1,6 +1,12 @@
 Changelog
 =========
 
+v0.4.2
+------
+- Map dialog: Remove button now turns Map off and closes the window
+- Map missing message includes PLTVIEW_WITH_MAP=1 install hint
+- Rotate Y-axis label 90° CCW with improved spacing
+
 v0.4.1
 ------
 - Add optional map layer installation via pip and environment variable
