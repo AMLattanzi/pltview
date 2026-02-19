@@ -185,6 +185,9 @@ int use_custom_range = 0;  /* Flag for using custom min/max */
 double custom_vmin = 0.0;
 double custom_vmax = 1.0;
 
+/* Scale mode for colorbar: 0=Linear, 1=Log(+), 2=Log(-) */
+int scale_mode = 0;
+
 /* Multi-timestep support */
 char *timestep_paths[MAX_TIMESTEPS];  /* Array of plotfile paths */
 int timestep_numbers[MAX_TIMESTEPS];   /* Numerical values for sorting */
@@ -276,6 +279,7 @@ const char *get_variable_unit(const char *varname);
 void draw_colorbar(double vmin, double vmax, int cmap_type, const char *varname);
 void cmap_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void colormap_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void colorbar_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void colorbar_expose_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void init_gui(PlotfileData *pf, int argc, char **argv);
 void render_slice(PlotfileData *pf);
@@ -2058,17 +2062,53 @@ const char *get_variable_unit(const char *varname) {
     return "";  /* Unknown - no unit */
 }
 
-/* Apply colormap to data */
-void apply_colormap(double *data, int width, int height, 
+/* Apply colormap to data with scale_mode support */
+void apply_colormap(double *data, int width, int height,
                    unsigned long *pixels, double vmin, double vmax, int cmap_type) {
     int i, j;
     double range = vmax - vmin;
     if (range < 1e-10) range = 1.0;
-    
+
     for (j = 0; j < height; j++) {
         for (i = 0; i < width; i++) {
             double val = data[j * width + i];
-            double t = (val - vmin) / range;
+            double t;
+
+            if (scale_mode == 0) {  /* Linear */
+                t = (val - vmin) / range;
+            } else if (scale_mode == 1) {  /* Log(+) */
+                if (val <= 0) {
+                    pixels[j * width + i] = 0xC0C0C0;  /* Gray for non-positive */
+                    continue;
+                }
+                /* Map log(val) to [0,1] using log(vmin) to log(vmax) */
+                double log_vmin = (vmin > 0) ? log10(vmin) : log10(1e-10);
+                double log_vmax = (vmax > 0) ? log10(vmax) : log10(1e-10);
+                if (log_vmax - log_vmin < 1e-10) {
+                    t = 0.5;
+                } else {
+                    t = (log10(val) - log_vmin) / (log_vmax - log_vmin);
+                }
+            } else {  /* Log(-) for scale_mode == 2 */
+                if (val >= 0) {
+                    pixels[j * width + i] = 0xC0C0C0;  /* Gray for non-negative */
+                    continue;
+                }
+                /* Use absolute value, flip the range */
+                double abs_val = -val;
+                double abs_vmax = (vmin < 0) ? -vmin : 1e-10;
+                double abs_vmin = (vmax < 0) ? -vmax : 1e-10;
+                double log_vmin = log10(abs_vmin > 0 ? abs_vmin : 1e-10);
+                double log_vmax = log10(abs_vmax > 0 ? abs_vmax : 1e-10);
+                if (log_vmax - log_vmin < 1e-10) {
+                    t = 0.5;
+                } else {
+                    t = (log10(abs_val) - log_vmin) / (log_vmax - log_vmin);
+                }
+            }
+
+            if (t < 0) t = 0;
+            if (t > 1) t = 1;
             RGB color = get_colormap_rgb(t, cmap_type);
             pixels[j * width + i] = (color.r << 16) | (color.g << 8) | color.b;
         }
@@ -2130,7 +2170,38 @@ void draw_colorbar(double vmin, double vmax, int cmap_type, const char *varname)
 
     for (int i = 0; i < n_ticks; i++) {
         double fraction = (double)i / (n_ticks - 1);
-        double value = vmin + fraction * (vmax - vmin);
+        double value;
+
+        if (scale_mode == 0) {  /* Linear */
+            value = vmin + fraction * (vmax - vmin);
+            snprintf(text, sizeof(text), "%.2e", value);
+        } else if (scale_mode == 1) {  /* Log(+) */
+            /* Logarithmic tick spacing */
+            double log_vmin = (vmin > 0) ? log10(vmin) : log10(1e-10);
+            double log_vmax = (vmax > 0) ? log10(vmax) : log10(1e-10);
+            double log_val = log_vmin + fraction * (log_vmax - log_vmin);
+            value = pow(10.0, log_val);
+            /* Format as 10^x for cleaner display */
+            if (log_val == floor(log_val)) {
+                snprintf(text, sizeof(text), "10^%.0f", log_val);
+            } else {
+                snprintf(text, sizeof(text), "%.1e", value);
+            }
+        } else {  /* Log(-) */
+            /* For negative log scale, show -10^x format */
+            double abs_vmax = (vmin < 0) ? -vmin : 1e-10;
+            double abs_vmin = (vmax < 0) ? -vmax : 1e-10;
+            double log_vmin = log10(abs_vmin > 0 ? abs_vmin : 1e-10);
+            double log_vmax = log10(abs_vmax > 0 ? abs_vmax : 1e-10);
+            double log_val = log_vmin + fraction * (log_vmax - log_vmin);
+            value = -pow(10.0, log_val);
+            /* Format as -10^x for cleaner display */
+            if (log_val == floor(log_val)) {
+                snprintf(text, sizeof(text), "-10^%.0f", log_val);
+            } else {
+                snprintf(text, sizeof(text), "%.1e", value);
+            }
+        }
 
         /* Map to drawable area with margins */
         int y = top_margin + (canvas_height - top_margin - bottom_margin) -
@@ -2140,7 +2211,6 @@ void draw_colorbar(double vmin, double vmax, int cmap_type, const char *varname)
         XDrawLine(display, colorbar, text_gc, width, y, width + 5, y);
 
         /* Draw label with vertical centering adjustment */
-        snprintf(text, sizeof(text), "%.2e", value);
         XDrawString(display, colorbar, text_gc, width + 8, y + 4, text, strlen(text));
     }
 
@@ -2181,6 +2251,21 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     XtSetArg(args[n], XtNright, XawChainRight); n++;
     info_label = XtCreateManagedWidget("info", labelWidgetClass, form, args, n);
     
+    /* Calculate viewport width based on longest variable name */
+    int var_viewport_width = 120;  /* Minimum width */
+    if (font) {
+        int max_text_width = 0;
+        for (i = 0; i < pf->n_vars; i++) {
+            int w = XTextWidth(font, pf->variables[i], strlen(pf->variables[i]));
+            if (w > max_text_width) max_text_width = w;
+        }
+        /* Add padding: button internalWidth (8) + border (4) + highlight (4) +
+           box hSpace (8) + scrollbar (20) + safety margin (36) = 80 */
+        var_viewport_width = max_text_width + 80;
+        if (var_viewport_width < 120) var_viewport_width = 120;
+        if (var_viewport_width > 400) var_viewport_width = 400;
+    }
+
     /* Variable buttons viewport (use internal scrollbar) */
     n = 0;
     XtSetArg(args[n], XtNfromVert, info_label); n++;
@@ -2192,7 +2277,7 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     XtSetArg(args[n], XtNallowHoriz, False); n++;
     XtSetArg(args[n], XtNforceBars, True); n++;
     XtSetArg(args[n], XtNheight, canvas_height); n++;
-    XtSetArg(args[n], XtNwidth, 200); n++;
+    XtSetArg(args[n], XtNwidth, var_viewport_width); n++;
     var_viewport = XtCreateManagedWidget("varViewport", viewportWidgetClass, form, args, n);
     XtAddEventHandler(var_viewport, ButtonPressMask, False, var_viewport_wheel_handler, NULL);
     XtAddEventHandler(var_viewport, StructureNotifyMask, False, var_viewport_configure_handler, NULL);
@@ -2295,7 +2380,7 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     map_button_widget = XtCreateManagedWidget("Map", commandWidgetClass, axis_box, args, n);
     XtAddCallback(map_button_widget, XtNcallback, map_button_callback, NULL);
 
-    /* COLUMN 2, ROW 2: Tools box (Colormap, Range, Distrib) */
+    /* COLUMN 2, ROW 2: Tools box (Colorbar, Distrib, Quiver, Zoom) */
     Widget tools_box;
     n = 0;
     XtSetArg(args[n], XtNfromVert, axis_box); n++;
@@ -2306,17 +2391,11 @@ void init_gui(PlotfileData *pf, int argc, char **argv) {
     XtSetArg(args[n], XtNleft, XawChainLeft); n++;
     tools_box = XtCreateManagedWidget("toolsBox", boxWidgetClass, form, args, n);
 
-    /* Colormap button - opens popup with colormap options */
+    /* Colorbar button - combined dialog for colormap, range, and scale */
     n = 0;
-    XtSetArg(args[n], XtNlabel, "Colormap"); n++;
-    button = XtCreateManagedWidget("colormap", commandWidgetClass, tools_box, args, n);
-    XtAddCallback(button, XtNcallback, colormap_button_callback, NULL);
-
-    /* Range button for custom colorbar min/max */
-    n = 0;
-    XtSetArg(args[n], XtNlabel, "Range"); n++;
-    button = XtCreateManagedWidget("range", commandWidgetClass, tools_box, args, n);
-    XtAddCallback(button, XtNcallback, range_button_callback, NULL);
+    XtSetArg(args[n], XtNlabel, "Colorbar"); n++;
+    button = XtCreateManagedWidget("colorbar", commandWidgetClass, tools_box, args, n);
+    XtAddCallback(button, XtNcallback, colorbar_button_callback, NULL);
 
     /* Distribution button for current layer histogram */
     n = 0;
@@ -3259,29 +3338,65 @@ void jump_button_callback(Widget w, XtPointer client_data, XtPointer call_data) 
     }
 }
 
-/* Structure for range dialog */
+/* Structure for colorbar dialog (combines range + colormap + scale) */
 typedef struct {
-    Widget min_text;
-    Widget max_text;
+    Widget max_text;      /* Max input (shown first) */
+    Widget min_text;      /* Min input (shown second) */
     Widget dialog_shell;
-} RangeDialogData;
+    Widget scale_buttons[3];  /* Linear, Log(+), Log(-) buttons */
+} ColorbarDialogData;
 
-/* Global pointer to range dialog data for keyboard input */
-RangeDialogData *active_range_dialog = NULL;
-int active_field = 0;  /* 0 = min, 1 = max */
+/* Global pointer to colorbar dialog data for keyboard input */
+ColorbarDialogData *active_colorbar_dialog = NULL;
+int active_field = 0;  /* 0 = max, 1 = min */
 
-/* Apply custom range callback */
-void range_apply_callback(Widget w, XtPointer client_data, XtPointer call_data) {
-    RangeDialogData *data = (RangeDialogData *)client_data;
+/* Update scale button labels to show current selection */
+void update_scale_button_labels(ColorbarDialogData *data) {
+    if (!data) return;
+    Arg args[1];
+    const char *labels[] = {"Linear", "Log(+)", "Log(-)"};
+    for (int i = 0; i < 3; i++) {
+        char label[16];
+        if (i == scale_mode) {
+            snprintf(label, sizeof(label), "[%s]", labels[i]);
+        } else {
+            snprintf(label, sizeof(label), "%s", labels[i]);
+        }
+        XtSetArg(args[0], XtNlabel, label);
+        XtSetValues(data->scale_buttons[i], args, 1);
+    }
+}
+
+/* Scale mode toggle callback */
+void colorbar_scale_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    int new_mode = (int)(long)client_data;
+    scale_mode = new_mode;
+
+    /* Update button labels to show selection */
+    if (active_colorbar_dialog) {
+        update_scale_button_labels(active_colorbar_dialog);
+    }
+
+    /* Re-render with new scale mode */
+    if (global_pf) {
+        render_slice(global_pf);
+        draw_colorbar(current_vmin, current_vmax, global_pf->colormap,
+                      global_pf->variables[global_pf->current_var]);
+    }
+}
+
+/* Apply colorbar settings callback */
+void colorbar_apply_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    ColorbarDialogData *data = (ColorbarDialogData *)client_data;
 
     if (data) {
         String min_str, max_str;
         Arg args[1];
 
-        XtSetArg(args[0], XtNstring, &min_str);
-        XtGetValues(data->min_text, args, 1);
         XtSetArg(args[0], XtNstring, &max_str);
         XtGetValues(data->max_text, args, 1);
+        XtSetArg(args[0], XtNstring, &min_str);
+        XtGetValues(data->min_text, args, 1);
 
         if (min_str && strlen(min_str) > 0 && max_str && strlen(max_str) > 0) {
             double new_min = atof(min_str);
@@ -3305,13 +3420,13 @@ void range_apply_callback(Widget w, XtPointer client_data, XtPointer call_data) 
         free(data);
         dialog_active = 0;
         active_text_widget = NULL;
-        active_range_dialog = NULL;
+        active_colorbar_dialog = NULL;
     }
 }
 
 /* Auto range callback - reset to data-driven min/max */
-void range_auto_callback(Widget w, XtPointer client_data, XtPointer call_data) {
-    RangeDialogData *data = (RangeDialogData *)client_data;
+void colorbar_auto_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    ColorbarDialogData *data = (ColorbarDialogData *)client_data;
 
     use_custom_range = 0;
 
@@ -3327,13 +3442,13 @@ void range_auto_callback(Widget w, XtPointer client_data, XtPointer call_data) {
         free(data);
         dialog_active = 0;
         active_text_widget = NULL;
-        active_range_dialog = NULL;
+        active_colorbar_dialog = NULL;
     }
 }
 
-/* Close range dialog callback */
-void range_close_callback(Widget w, XtPointer client_data, XtPointer call_data) {
-    RangeDialogData *data = (RangeDialogData *)client_data;
+/* Close colorbar dialog callback */
+void colorbar_close_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    ColorbarDialogData *data = (ColorbarDialogData *)client_data;
 
     if (data) {
         XtPopdown(data->dialog_shell);
@@ -3341,31 +3456,13 @@ void range_close_callback(Widget w, XtPointer client_data, XtPointer call_data) 
         free(data);
         dialog_active = 0;
         active_text_widget = NULL;
-        active_range_dialog = NULL;
+        active_colorbar_dialog = NULL;
     }
 }
 
-/* Focus on min field */
-void range_min_focus_callback(Widget w, XtPointer client_data, XtPointer call_data) {
-    RangeDialogData *data = (RangeDialogData *)client_data;
-    if (data) {
-        active_text_widget = data->min_text;
-        active_field = 0;
-    }
-}
-
-/* Focus on max field */
-void range_max_focus_callback(Widget w, XtPointer client_data, XtPointer call_data) {
-    RangeDialogData *data = (RangeDialogData *)client_data;
-    if (data) {
-        active_text_widget = data->max_text;
-        active_field = 1;
-    }
-}
-
-/* Ensure focus follows mouse clicks in range dialog text fields */
-void range_text_click_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch) {
-    RangeDialogData *data = (RangeDialogData *)client_data;
+/* Ensure focus follows mouse clicks in colorbar dialog text fields */
+void colorbar_text_click_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch) {
+    ColorbarDialogData *data = (ColorbarDialogData *)client_data;
     if (!data || event->type != ButtonPress) return;
 
     XtSetKeyboardFocus(data->dialog_shell, w);
@@ -3373,112 +3470,167 @@ void range_text_click_handler(Widget w, XtPointer client_data, XEvent *event, Bo
     XtCallAcceptFocus(w, &time);
 
     active_text_widget = w;
-    active_field = (w == data->max_text) ? 1 : 0;
+    active_field = (w == data->min_text) ? 1 : 0;  /* 0=max, 1=min */
 }
 
-/* Range button callback - dialog to set custom min/max */
-void range_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+/* Colormap selection callback for colorbar dialog */
+void colorbar_cmap_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    int cmap = (int)(long)client_data;
+    if (global_pf) {
+        global_pf->colormap = cmap;
+        render_slice(global_pf);
+        draw_colorbar(current_vmin, current_vmax, cmap,
+                      global_pf->variables[global_pf->current_var]);
+    }
+}
+
+/* Colorbar button callback - combined dialog for range, scale, and colormap */
+void colorbar_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
     if (global_pf) {
         Arg args[10];
-        int n;
+        int n, i;
         Widget dialog_shell, form, label, button, min_text, max_text;
         char min_str[64], max_str[64];
 
         /* Format current values */
-        snprintf(min_str, sizeof(min_str), "%.6e", use_custom_range ? custom_vmin : current_vmin);
         snprintf(max_str, sizeof(max_str), "%.6e", use_custom_range ? custom_vmax : current_vmax);
+        snprintf(min_str, sizeof(min_str), "%.6e", use_custom_range ? custom_vmin : current_vmin);
 
         n = 0;
-        XtSetArg(args[n], XtNtitle, "Set Colorbar Range"); n++;
-        dialog_shell = XtCreatePopupShell("rangeDialog", transientShellWidgetClass, toplevel, args, n);
+        XtSetArg(args[n], XtNtitle, "Colorbar Settings"); n++;
+        dialog_shell = XtCreatePopupShell("colorbarDialog", transientShellWidgetClass, toplevel, args, n);
 
         n = 0;
         form = XtCreateManagedWidget("form", formWidgetClass, dialog_shell, args, n);
 
-        /* Title label */
+        /* --- Range Section --- */
         n = 0;
-        XtSetArg(args[n], XtNlabel, "Set colorbar min/max values:"); n++;
+        XtSetArg(args[n], XtNlabel, "Range:"); n++;
         XtSetArg(args[n], XtNborderWidth, 0); n++;
-        label = XtCreateManagedWidget("title", labelWidgetClass, form, args, n);
+        label = XtCreateManagedWidget("rangeLabel", labelWidgetClass, form, args, n);
 
-        /* Min label */
+        /* Max label (shown first per user request) */
         n = 0;
         XtSetArg(args[n], XtNfromVert, label); n++;
-        XtSetArg(args[n], XtNlabel, "Min:"); n++;
-        XtSetArg(args[n], XtNborderWidth, 0); n++;
-        Widget min_label = XtCreateManagedWidget("minLabel", labelWidgetClass, form, args, n);
-
-        /* Min text input */
-        n = 0;
-        XtSetArg(args[n], XtNfromVert, label); n++;
-        XtSetArg(args[n], XtNfromHoriz, min_label); n++;
-        XtSetArg(args[n], XtNwidth, 150); n++;
-        XtSetArg(args[n], XtNeditType, XawtextEdit); n++;
-        XtSetArg(args[n], XtNstring, min_str); n++;
-        min_text = XtCreateManagedWidget("minInput", asciiTextWidgetClass, form, args, n);
-
-        /* Max label */
-        n = 0;
-        XtSetArg(args[n], XtNfromVert, min_label); n++;
         XtSetArg(args[n], XtNlabel, "Max:"); n++;
         XtSetArg(args[n], XtNborderWidth, 0); n++;
         Widget max_label = XtCreateManagedWidget("maxLabel", labelWidgetClass, form, args, n);
 
         /* Max text input */
         n = 0;
-        XtSetArg(args[n], XtNfromVert, min_label); n++;
+        XtSetArg(args[n], XtNfromVert, label); n++;
         XtSetArg(args[n], XtNfromHoriz, max_label); n++;
         XtSetArg(args[n], XtNwidth, 150); n++;
         XtSetArg(args[n], XtNeditType, XawtextEdit); n++;
         XtSetArg(args[n], XtNstring, max_str); n++;
         max_text = XtCreateManagedWidget("maxInput", asciiTextWidgetClass, form, args, n);
 
-        /* Create data structure */
-        RangeDialogData *range_data = malloc(sizeof(RangeDialogData));
-        range_data->min_text = min_text;
-        range_data->max_text = max_text;
-        range_data->dialog_shell = dialog_shell;
+        /* Min label */
+        n = 0;
+        XtSetArg(args[n], XtNfromVert, max_label); n++;
+        XtSetArg(args[n], XtNlabel, "Min:"); n++;
+        XtSetArg(args[n], XtNborderWidth, 0); n++;
+        Widget min_label = XtCreateManagedWidget("minLabel", labelWidgetClass, form, args, n);
+
+        /* Min text input */
+        n = 0;
+        XtSetArg(args[n], XtNfromVert, max_label); n++;
+        XtSetArg(args[n], XtNfromHoriz, min_label); n++;
+        XtSetArg(args[n], XtNwidth, 150); n++;
+        XtSetArg(args[n], XtNeditType, XawtextEdit); n++;
+        XtSetArg(args[n], XtNstring, min_str); n++;
+        min_text = XtCreateManagedWidget("minInput", asciiTextWidgetClass, form, args, n);
+
+        /* --- Scale Section --- */
+        n = 0;
+        XtSetArg(args[n], XtNfromVert, min_label); n++;
+        XtSetArg(args[n], XtNlabel, "Scale:"); n++;
+        XtSetArg(args[n], XtNborderWidth, 0); n++;
+        Widget scale_label = XtCreateManagedWidget("scaleLabel", labelWidgetClass, form, args, n);
+
+        /* Create data structure early so scale buttons can use it */
+        ColorbarDialogData *colorbar_data = malloc(sizeof(ColorbarDialogData));
+        colorbar_data->max_text = max_text;
+        colorbar_data->min_text = min_text;
+        colorbar_data->dialog_shell = dialog_shell;
+
+        /* Scale toggle buttons: Linear, Log(+), Log(-) */
+        const char *scale_labels[] = {"Linear", "Log(+)", "Log(-)"};
+        Widget prev_scale = scale_label;
+        for (i = 0; i < 3; i++) {
+            char btn_label[16];
+            if (i == scale_mode) {
+                snprintf(btn_label, sizeof(btn_label), "[%s]", scale_labels[i]);
+            } else {
+                snprintf(btn_label, sizeof(btn_label), "%s", scale_labels[i]);
+            }
+            n = 0;
+            XtSetArg(args[n], XtNfromVert, min_label); n++;
+            XtSetArg(args[n], XtNfromHoriz, prev_scale); n++;
+            XtSetArg(args[n], XtNlabel, btn_label); n++;
+            colorbar_data->scale_buttons[i] = XtCreateManagedWidget(scale_labels[i], commandWidgetClass, form, args, n);
+            XtAddCallback(colorbar_data->scale_buttons[i], XtNcallback, colorbar_scale_callback, (XtPointer)(long)i);
+            prev_scale = colorbar_data->scale_buttons[i];
+        }
+
+        /* --- Colormap Section --- */
+        n = 0;
+        XtSetArg(args[n], XtNfromVert, scale_label); n++;
+        XtSetArg(args[n], XtNlabel, "Colormap:"); n++;
+        XtSetArg(args[n], XtNborderWidth, 0); n++;
+        Widget cmap_label = XtCreateManagedWidget("cmapLabel", labelWidgetClass, form, args, n);
+
+        /* Colormap buttons in a row */
+        const char *cmap_names[] = {"viridis", "jet", "turbo", "plasma", "hot", "cool", "gray", "magma"};
+        Widget prev_cmap = cmap_label;
+        for (i = 0; i < 8; i++) {
+            n = 0;
+            XtSetArg(args[n], XtNfromVert, scale_label); n++;
+            XtSetArg(args[n], XtNfromHoriz, prev_cmap); n++;
+            XtSetArg(args[n], XtNlabel, cmap_names[i]); n++;
+            button = XtCreateManagedWidget(cmap_names[i], commandWidgetClass, form, args, n);
+            XtAddCallback(button, XtNcallback, colorbar_cmap_callback, (XtPointer)(long)i);
+            prev_cmap = button;
+        }
 
         /* Click-to-focus handlers for text fields */
-        XtAddEventHandler(min_text, ButtonPressMask, False, range_text_click_handler, (XtPointer)range_data);
-        XtAddEventHandler(max_text, ButtonPressMask, False, range_text_click_handler, (XtPointer)range_data);
+        XtAddEventHandler(max_text, ButtonPressMask, False, colorbar_text_click_handler, (XtPointer)colorbar_data);
+        XtAddEventHandler(min_text, ButtonPressMask, False, colorbar_text_click_handler, (XtPointer)colorbar_data);
 
-        /* Apply button */
+        /* --- Action Buttons --- */
         n = 0;
-        XtSetArg(args[n], XtNfromVert, max_label); n++;
+        XtSetArg(args[n], XtNfromVert, cmap_label); n++;
         XtSetArg(args[n], XtNlabel, "Apply"); n++;
         button = XtCreateManagedWidget("apply", commandWidgetClass, form, args, n);
-        XtAddCallback(button, XtNcallback, range_apply_callback, (XtPointer)range_data);
+        XtAddCallback(button, XtNcallback, colorbar_apply_callback, (XtPointer)colorbar_data);
 
-        /* Auto button */
         n = 0;
-        XtSetArg(args[n], XtNfromVert, max_label); n++;
+        XtSetArg(args[n], XtNfromVert, cmap_label); n++;
         XtSetArg(args[n], XtNfromHoriz, button); n++;
         XtSetArg(args[n], XtNlabel, "Auto"); n++;
-        button = XtCreateManagedWidget("auto", commandWidgetClass, form, args, n);
-        XtAddCallback(button, XtNcallback, range_auto_callback, (XtPointer)range_data);
+        Widget auto_button = XtCreateManagedWidget("auto", commandWidgetClass, form, args, n);
+        XtAddCallback(auto_button, XtNcallback, colorbar_auto_callback, (XtPointer)colorbar_data);
 
-        /* Close button */
         n = 0;
-        XtSetArg(args[n], XtNfromVert, max_label); n++;
-        XtSetArg(args[n], XtNfromHoriz, button); n++;
+        XtSetArg(args[n], XtNfromVert, cmap_label); n++;
+        XtSetArg(args[n], XtNfromHoriz, auto_button); n++;
         XtSetArg(args[n], XtNlabel, "Close"); n++;
         button = XtCreateManagedWidget("close", commandWidgetClass, form, args, n);
-        XtAddCallback(button, XtNcallback, range_close_callback, (XtPointer)range_data);
+        XtAddCallback(button, XtNcallback, colorbar_close_callback, (XtPointer)colorbar_data);
 
         XtRealizeWidget(dialog_shell);
         XtPopup(dialog_shell, XtGrabExclusive);
 
-        /* Set keyboard focus to min text input */
-        XtSetKeyboardFocus(dialog_shell, min_text);
+        /* Set keyboard focus to max text input (shown first) */
+        XtSetKeyboardFocus(dialog_shell, max_text);
         XSync(display, False);
         Time time = CurrentTime;
-        XtCallAcceptFocus(min_text, &time);
+        XtCallAcceptFocus(max_text, &time);
 
         dialog_active = 1;
-        active_text_widget = min_text;
-        active_range_dialog = range_data;
-        active_field = 0;
+        active_text_widget = max_text;
+        active_colorbar_dialog = colorbar_data;
+        active_field = 0;  /* 0=max */
     }
 }
 

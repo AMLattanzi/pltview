@@ -1,6 +1,13 @@
 Changelog
 =========
 
+v0.4.3
+------
+- Combined Colorbar dialog: merge Colormap and Range buttons into single Colorbar button
+- Log scale support: Linear, Log(+) for positive values, Log(-) for negative values
+- Log scale grays out invalid values (non-positive for Log(+), non-negative for Log(-))
+- Colorbar tick labels adapt to show 10^x format in log modes
+
 v0.4.2
 ------
 - Map dialog: Remove button now turns Map off and closes the window
