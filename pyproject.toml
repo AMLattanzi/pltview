@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pltview"
-version = "0.4.3"
+version = "0.5.0"
 description = "Lightweight C viewer for AMReX plotfiles, inspired by ncview"
 readme = "README.md"
 requires-python = ">=3.6"
 license = {text = "MIT"}
 authors = [
-    {name = "wang1202", email = "aaronaktv@gmail.com"}
+    {name = "Aaron Wang", email = "aaronaktv@gmail.com"}
 ]
 keywords = ["amrex", "plotfile", "visualization", "scientific computing", "c", "x11"]
 classifiers = [

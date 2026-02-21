@@ -1,6 +1,16 @@
 Changelog
 =========
 
+v0.5.0
+------
+- SBM mode: Add --sbm flag for Spectral Bin Microphysics droplet size distribution
+- SBM metrics: QC Mass, QI Mass, Total Mass, QC Num, QI Num, Total Num
+- SBM log-spaced bins: Use geometric mean for bin edges (sqrt of adjacent centers)
+- SBM PDF mode: Normalize histogram to probability density function (integral = 1)
+- Distribution popup: Add Layer/Domain mode toggle buttons
+- Distribution popup: Show AMR level explicitly in title
+- Improved Y-axis tick formatting for small values (PDF mode)
+
 v0.4.3
 ------
 - Combined Colorbar dialog: merge Colormap and Range buttons into single Colorbar button
