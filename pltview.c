@@ -2745,6 +2745,7 @@ void var_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
         zoom_reset();
         update_info_label(global_pf);
         render_slice(global_pf);
+        update_distribution_histogram(-1);  /* Auto-update distribution popup */
     }
 }
 
@@ -2772,6 +2773,7 @@ void axis_button_callback(Widget w, XtPointer client_data, XtPointer call_data) 
         update_layer_label(global_pf);
         update_info_label(global_pf);
         render_slice(global_pf);
+        update_distribution_histogram(-1);  /* Auto-update distribution popup */
     }
 }
 
@@ -3214,6 +3216,7 @@ void level_button_callback(Widget w, XtPointer client_data, XtPointer call_data)
     update_layer_label(global_pf);
     update_info_label(global_pf);
     render_slice(global_pf);
+    update_distribution_histogram(-1);  /* Auto-update distribution popup */
 }
 
 /* Overlay toggle button callback */
@@ -3256,7 +3259,7 @@ void nav_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
     int dir = (int)(long)client_data;  /* 0 = minus, 1 = plus */
     if (global_pf) {
         int max_idx = global_pf->grid_dims[global_pf->slice_axis] - 1;
-        
+
         if (dir == 1) {
             /* Plus: go to next layer, wrap to 0 if at end */
             global_pf->slice_idx++;
@@ -3270,10 +3273,11 @@ void nav_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
                 global_pf->slice_idx = max_idx;
             }
         }
-        
+
         update_layer_label(global_pf);
         update_info_label(global_pf);
         render_slice(global_pf);
+        update_distribution_histogram(-1);  /* Auto-update distribution popup */
     }
 }
 
@@ -3298,9 +3302,10 @@ void jump_to_layer_callback(Widget w, XtPointer client_data, XtPointer call_data
             update_layer_label(global_pf);
             update_info_label(global_pf);
             render_slice(global_pf);
+            update_distribution_histogram(-1);  /* Auto-update distribution popup */
         }
     }
-    
+
     /* Close the dialog */
     Widget shell = XtParent(XtParent(w));
     XtPopdown(shell);
@@ -3338,8 +3343,9 @@ void jump_to_typed_layer_callback(Widget w, XtPointer client_data, XtPointer cal
             update_layer_label(global_pf);
             update_info_label(global_pf);
             render_slice(global_pf);
+            update_distribution_histogram(-1);  /* Auto-update distribution popup */
         }
-        
+
         /* Close the dialog */
         XtPopdown(data->dialog_shell);
         XtDestroyWidget(data->dialog_shell);
@@ -3947,6 +3953,8 @@ void render_slice(PlotfileData *pf) {
     int width, height;
     double *slice;
     double vmin = 1e30, vmax = -1e30;
+    double vsum = 0.0;
+    int vcount = 0;
     int i, j;
     char stats_text[128];
 
@@ -4036,11 +4044,13 @@ void render_slice(PlotfileData *pf) {
         }
     }
 
-    /* Find data min/max, skipping gap cells when mask is active */
+    /* Find data min/max/mean, skipping gap cells when mask is active */
     for (i = 0; i < width * height; i++) {
         if (base_in_box && !base_in_box[i]) continue;
         if (slice[i] < vmin) vmin = slice[i];
         if (slice[i] > vmax) vmax = slice[i];
+        vsum += slice[i];
+        vcount++;
     }
 
     /* When overlay mode is on, include all overlay levels in min/max for consistent colorbar */
@@ -4151,6 +4161,9 @@ void render_slice(PlotfileData *pf) {
     /* Store current vmin/vmax for colorbar */
     current_vmin = display_vmin;
     current_vmax = display_vmax;
+
+    /* Compute mean for stats display */
+    double vmean = (vcount > 0) ? vsum / vcount : 0.0;
 
     /* Clear canvas with white background */
     XSetForeground(display, gc, WhitePixel(display, screen));
@@ -5054,9 +5067,9 @@ void render_slice(PlotfileData *pf) {
 
     /* Draw text overlay - show display range (custom if set) */
     if (use_custom_range) {
-        snprintf(stats_text, sizeof(stats_text), "range: %.3e to %.3e (custom)", display_vmin, display_vmax);
+        snprintf(stats_text, sizeof(stats_text), "range: %.3e to %.3e (custom)  mean: %.3e", display_vmin, display_vmax, vmean);
     } else {
-        snprintf(stats_text, sizeof(stats_text), "min: %.3e  max: %.3e", display_vmin, display_vmax);
+        snprintf(stats_text, sizeof(stats_text), "min: %.3e  max: %.3e  mean: %.3e", display_vmin, display_vmax, vmean);
     }
     XSetForeground(display, text_gc, BlackPixel(display, screen));
     XSetBackground(display, text_gc, WhitePixel(display, screen));
@@ -6121,6 +6134,7 @@ void compute_distribution_data(DistributionPopupData *popup, int mode) {
 /* Redraw distribution histogram */
 void redraw_distribution_histogram(DistributionPopupData *popup) {
     if (!popup || !popup->canvas) return;
+    if (!XtIsRealized(popup->canvas)) return;
 
     Window win = XtWindow(popup->canvas);
     if (!win) return;
@@ -6137,6 +6151,7 @@ void redraw_distribution_histogram(DistributionPopupData *popup) {
                    popup->mean, popup->std, popup->skewness);
 
     XFreeGC(display, plot_gc);
+    XFlush(display);  /* Force immediate display update */
 }
 
 /* Distribution mode button callback */
@@ -6145,6 +6160,16 @@ void distrib_mode_callback(Widget w, XtPointer client_data, XtPointer call_data)
     if (!g_distrib_popup) return;
 
     compute_distribution_data(g_distrib_popup, mode);
+    redraw_distribution_histogram(g_distrib_popup);
+}
+
+/* Update distribution popup if it's open (called when layer changes) */
+void update_distribution_histogram(int mode) {
+    if (!g_distrib_popup) return;
+
+    /* Use current mode if mode is -1, otherwise use specified mode */
+    int update_mode = (mode < 0) ? g_distrib_popup->mode : mode;
+    compute_distribution_data(g_distrib_popup, update_mode);
     redraw_distribution_histogram(g_distrib_popup);
 }
 
@@ -9493,12 +9518,13 @@ int main(int argc, char **argv) {
                 update_layer_label(global_pf);
                 update_info_label(global_pf);
                 render_slice(global_pf);
+                update_distribution_histogram(-1);  /* Auto-update distribution popup */
             }
         }
-        
+
         XtDispatchEvent(&event);
     }
-    
+
     cleanup(&pf);
     return 0;
 }

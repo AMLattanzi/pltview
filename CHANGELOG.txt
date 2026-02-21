@@ -1,6 +1,11 @@
 Changelog
 =========
 
+v0.5.1
+------
+- Stats display: Add mean value alongside min/max at bottom-left of plot
+- Distribution popup: Auto-update histogram when layer, variable, axis, or level changes
+
 v0.5.0
 ------
 - SBM mode: Add --sbm flag for Spectral Bin Microphysics droplet size distribution
