@@ -6384,6 +6384,9 @@ void draw_sdm_histogram(Display *dpy, Window win, GC plot_gc, HistogramData *his
         log_xmin = (x_min > 0) ? log10(x_min) : log10(x_max) - 3;
         log_xmax = (x_max > 0) ? log10(x_max) : 0;
         if (log_xmin >= log_xmax) log_xmin = log_xmax - 1;
+    } else {
+        /* In linear mode, start x-axis from 0 */
+        x_min = 0;
     }
 
     /* Draw X-axis ticks */

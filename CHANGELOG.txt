@@ -1,6 +1,10 @@
 Changelog
 =========
 
+v0.5.3
+------
+- SDM mode: X-axis now starts from 0 in linear mode
+
 v0.5.2
 ------
 - SDM mode: Add LogBin toggle for log-spaced bins (constant width in log space)
