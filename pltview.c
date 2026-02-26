@@ -133,6 +133,7 @@ typedef struct {
     int current_metric;    /* Current y-axis metric (SDM_METRIC_*) */
     int log_x;              /* 0=linear, 1=log10 x-axis */
     int log_y;              /* 0=linear, 1=log10 y-axis */
+    int log_bin;            /* 0=linear bin width, 1=log-spaced bins */
     double cutoff_radius;   /* Cutoff in um (0 = no cutoff) */
     double custom_bin_width; /* Custom bin width in um (0 = auto/Sturges) */
     /* Per-grid info from particle Header */
@@ -395,6 +396,7 @@ void sdm_switch_timestep(ParticleData *pd, int new_timestep);
 void update_sdm_info_label(ParticleData *pd, const char *plotfile_dir);
 void sdm_logx_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void sdm_logy_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void sdm_logbin_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void sdm_settings_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void sdm_settings_apply_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void sdm_settings_close_callback(Widget w, XtPointer client_data, XtPointer call_data);
@@ -7888,8 +7890,8 @@ void compute_sdm_histogram(ParticleData *pd, HistogramData *hist) {
         if (bin_width == 0) bin_width = 1.0;
     }
 
-    /* Log-X binning: use log-spaced bins */
-    int use_log_bins = pd->log_x && rmin > 0;
+    /* Log-spaced bins if log_bin enabled and rmin > 0 */
+    int use_log_bins = pd->log_bin && rmin > 0;
     double log_rmin = 0, log_rmax = 0, log_bin_width = 0;
     if (use_log_bins) {
         log_rmin = log10(rmin);
@@ -7901,15 +7903,22 @@ void compute_sdm_histogram(ParticleData *pd, HistogramData *hist) {
     /* Allocate bin arrays */
     double *bin_counts = (double *)calloc(n_bins, sizeof(double));
     double *bin_centers = (double *)malloc(n_bins * sizeof(double));
+    double *bin_edges = (double *)malloc((n_bins + 1) * sizeof(double));
     double *bin_sd_counts = (double *)calloc(n_bins, sizeof(double));
     double *bin_mass = (double *)calloc(n_bins, sizeof(double));
 
     if (use_log_bins) {
+        for (int i = 0; i <= n_bins; i++) {
+            bin_edges[i] = pow(10.0, log_rmin + i * log_bin_width);
+        }
         for (int i = 0; i < n_bins; i++) {
             double log_center = log_rmin + (i + 0.5) * log_bin_width;
             bin_centers[i] = pow(10.0, log_center);
         }
     } else {
+        for (int i = 0; i <= n_bins; i++) {
+            bin_edges[i] = rmin + i * bin_width;
+        }
         for (int i = 0; i < n_bins; i++) {
             bin_centers[i] = rmin + (i + 0.5) * bin_width;
         }
@@ -7999,7 +8008,7 @@ void compute_sdm_histogram(ParticleData *pd, HistogramData *hist) {
 
     hist->bin_counts = display_values;
     hist->bin_centers = bin_centers;
-    hist->bin_edges = NULL;  /* SDM uses uniform bin width */
+    hist->bin_edges = bin_edges;
     hist->n_bins = n_bins;
     hist->count_max = count_max;
     hist->bin_min = rmin;
@@ -8134,6 +8143,13 @@ void sdm_logy_callback(Widget w, XtPointer client_data, XtPointer call_data) {
     render_sdm_histogram(global_pd);
 }
 
+/* SDM LogBin toggle callback - log-spaced bins (constant width in log space) */
+void sdm_logbin_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    if (!global_pd) return;
+    global_pd->log_bin = !global_pd->log_bin;
+    render_sdm_histogram(global_pd);
+}
+
 /* SDM Settings apply callback */
 void sdm_settings_apply_callback(Widget w, XtPointer client_data, XtPointer call_data) {
     if (!global_pd) return;
@@ -8199,6 +8215,27 @@ void sdm_binwidth_focus_callback(Widget w, XtPointer client_data, XtPointer call
     sdm_active_field = 1;
 }
 
+/* SDM Settings text widget click-to-focus event handler */
+void sdm_text_click_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch) {
+    if (event->type == ButtonPress) {
+        /* Set keyboard focus to clicked widget */
+        Widget shell = XtParent(XtParent(w));  /* Get shell widget */
+        XtSetKeyboardFocus(shell, w);
+        Time time_val = event->xbutton.time;
+        XtCallAcceptFocus(w, &time_val);
+
+        /* Update active widget tracking */
+        if (w == sdm_settings_text_cutoff) {
+            sdm_active_text_widget = sdm_settings_text_cutoff;
+            sdm_active_field = 0;
+        } else if (w == sdm_settings_text_binwidth) {
+            sdm_active_text_widget = sdm_settings_text_binwidth;
+            sdm_active_field = 1;
+        }
+    }
+    *continue_dispatch = True;  /* Allow normal text widget processing */
+}
+
 /* SDM Settings button callback - open popup dialog */
 void sdm_settings_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
     Arg args[10];
@@ -8245,6 +8282,7 @@ void sdm_settings_button_callback(Widget w, XtPointer client_data, XtPointer cal
     XtSetArg(args[n], XtNeditType, XawtextEdit); n++;
     XtSetArg(args[n], XtNstring, cutoff_str); n++;
     sdm_settings_text_cutoff = XtCreateManagedWidget("cutoffInput", asciiTextWidgetClass, form_w, args, n);
+    XtAddEventHandler(sdm_settings_text_cutoff, ButtonPressMask, False, sdm_text_click_handler, NULL);
 
     /* Bin width label */
     n = 0;
@@ -8261,6 +8299,7 @@ void sdm_settings_button_callback(Widget w, XtPointer client_data, XtPointer cal
     XtSetArg(args[n], XtNeditType, XawtextEdit); n++;
     XtSetArg(args[n], XtNstring, binwidth_str); n++;
     sdm_settings_text_binwidth = XtCreateManagedWidget("bwInput", asciiTextWidgetClass, form_w, args, n);
+    XtAddEventHandler(sdm_settings_text_binwidth, ButtonPressMask, False, sdm_text_click_handler, NULL);
 
     /* Apply button */
     n = 0;
@@ -8386,6 +8425,12 @@ void init_sdm_gui(ParticleData *pd, const char *plotfile_dir, int argc, char **a
     XtSetArg(args[n], XtNlabel, "LogY"); n++;
     button = XtCreateManagedWidget("logY", commandWidgetClass, options_box, args, n);
     XtAddCallback(button, XtNcallback, sdm_logy_callback, NULL);
+
+    /* LogBin toggle button - log-spaced bins */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "LogBin"); n++;
+    button = XtCreateManagedWidget("logBin", commandWidgetClass, options_box, args, n);
+    XtAddCallback(button, XtNcallback, sdm_logbin_callback, NULL);
 
     /* Settings button */
     n = 0;

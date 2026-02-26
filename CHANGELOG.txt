@@ -1,6 +1,12 @@
 Changelog
 =========
 
+v0.5.2
+------
+- SDM mode: Add LogBin toggle for log-spaced bins (constant width in log space)
+- SDM mode: Fix histogram bar display on log X axis using explicit bin edges
+- SDM Settings: Fix click-to-focus on text input fields (Cutoff, Bin width)
+
 v0.5.1
 ------
 - Stats display: Add mean value alongside min/max at bottom-left of plot
