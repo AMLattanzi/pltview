@@ -1,6 +1,12 @@
 Changelog
 =========
 
+v0.5.4
+------
+- Add FFT button: 2D energy spectrum popup with Kolmogorov k^(-5/3) reference line
+- FFT method: Cooley-Tukey 2D FFT, Hann windowed, mean subtracted, power-of-2 truncation per axis
+- FFT popup shows method notes describing normalization and wavenumber convention
+
 v0.5.3
 ------
 - SDM mode: X-axis now starts from 0 in linear mode
