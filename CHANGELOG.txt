@@ -1,6 +1,17 @@
 Changelog
 =========
 
+v0.5.6
+------
+- FFT popup: Add method toggle between 2D FFT and Wiener-Khinchin (Ma et al. 2024)
+- FFT popup: Use centered square crop for 2D FFT (spectracam-style)
+- FFT spectrum: Add three reference slopes with spectracam colors:
+  - Purple k^(-1) Batchelor viscous-convective
+  - Orange k^(-5/3) Kolmogorov inertial range
+  - Pink k^(-3) Kraichnan 2D enstrophy cascade
+- FFT popup: More square aspect ratio, method notes with automatic text wrapping
+- Wiener-Khinchin mode: Shows horizontal (cyan) and vertical (green) spectra for isotropy check
+
 v0.5.5
 ------
 - SDM/SBM Settings: Add X-axis limits (X-min, X-max) in Settings dialog

@@ -6025,12 +6025,17 @@ static void fft1d_ct(Fft2DComplex *x, int N) {
 typedef struct {
     Widget shell;
     Widget canvas;
+    Widget method_fft_btn;   /* 2D FFT method button */
+    Widget method_wk_btn;    /* Wiener-Khinchin method button */
     PlotfileData *pf;
     double *k_vals;   /* Physical wavenumber for each bin (rad/unit) */
     double *e_vals;   /* Energy per bin: sum of |F|^2 / (Nx*Ny)^2 */
+    double *e_vals_y; /* For WK: vertical spectrum (NULL for 2D FFT) */
     int n_bins;       /* Number of valid bins */
+    int n_bins_y;     /* For WK: number of bins in vertical spectrum */
     int fft_nx;       /* FFT grid size (power-of-2) used in X */
     int fft_ny;       /* FFT grid size (power-of-2) used in Y */
+    int method;       /* 0 = 2D FFT, 1 = Wiener-Khinchin */
 } FFTPopupData;
 
 static FFTPopupData *g_fft_popup = NULL;
@@ -6040,6 +6045,7 @@ static void close_fft2d_popup_callback(Widget w, XtPointer client_data, XtPointe
     if (popup) {
         if (popup->k_vals) free(popup->k_vals);
         if (popup->e_vals) free(popup->e_vals);
+        if (popup->e_vals_y) free(popup->e_vals_y);
         XtDestroyWidget(popup->shell);
         free(popup);
         if (g_fft_popup == popup) g_fft_popup = NULL;
@@ -6050,28 +6056,33 @@ static void compute_2dfft_spectrum(FFTPopupData *popup) {
     PlotfileData *pf = popup->pf;
     if (!current_slice_data || slice_width <= 0 || slice_height <= 0) return;
 
-    /* Largest power-of-2 <= each dimension (cap at 2048 to limit memory) */
-    int Nx = 1, Ny = 1;
-    while (Nx * 2 <= slice_width  && Nx < 2048) Nx <<= 1;
-    while (Ny * 2 <= slice_height && Ny < 2048) Ny <<= 1;
-    if (Nx < 4 || Ny < 4) return;
+    /* Square region: min of dimensions, then largest power-of-2 (cap at 2048) */
+    int S = (slice_width < slice_height) ? slice_width : slice_height;
+    int N = 1;
+    while (N * 2 <= S && N < 2048) N <<= 1;
+    int Nx = N, Ny = N;
+    if (N < 4) return;
+
+    /* Center offsets for extracting the square region */
+    int ox = (slice_width - N) / 2;
+    int oy = (slice_height - N) / 2;
 
     Fft2DComplex *buf = (Fft2DComplex *)malloc((size_t)Nx * Ny * sizeof(Fft2DComplex));
     if (!buf) return;
 
     /* Fill buf with Hann-windowed slice data (subtract mean to reduce DC spike) */
     double mean_val = 0.0;
-    for (int iy = 0; iy < Ny; iy++)
-        for (int ix = 0; ix < Nx; ix++)
-            mean_val += current_slice_data[iy * slice_width + ix];
-    mean_val /= (double)(Nx * Ny);
+    for (int iy = 0; iy < N; iy++)
+        for (int ix = 0; ix < N; ix++)
+            mean_val += current_slice_data[(oy + iy) * slice_width + (ox + ix)];
+    mean_val /= (double)(N * N);
 
-    for (int iy = 0; iy < Ny; iy++) {
-        double wy = 0.5 * (1.0 - cos(2.0 * M_PI * iy / (Ny - 1)));
-        for (int ix = 0; ix < Nx; ix++) {
-            double wx = 0.5 * (1.0 - cos(2.0 * M_PI * ix / (Nx - 1)));
-            buf[iy * Nx + ix].r = (current_slice_data[iy * slice_width + ix] - mean_val) * wx * wy;
-            buf[iy * Nx + ix].i = 0.0;
+    for (int iy = 0; iy < N; iy++) {
+        double wy = 0.5 * (1.0 - cos(2.0 * M_PI * iy / (N - 1)));
+        for (int ix = 0; ix < N; ix++) {
+            double wx = 0.5 * (1.0 - cos(2.0 * M_PI * ix / (N - 1)));
+            buf[iy * N + ix].r = (current_slice_data[(oy + iy) * slice_width + (ox + ix)] - mean_val) * wx * wy;
+            buf[iy * N + ix].i = 0.0;
         }
     }
 
@@ -6152,6 +6163,160 @@ static void compute_2dfft_spectrum(FFTPopupData *popup) {
     free(e_sum);
 }
 
+/* Wiener-Khinchin method: row/column periodograms (Ma et al. 2024 approach) */
+static void compute_wk_spectrum(FFTPopupData *popup) {
+    PlotfileData *pf = popup->pf;
+    if (!current_slice_data || slice_width <= 0 || slice_height <= 0) return;
+
+    int W = slice_width, H = slice_height;
+    popup->fft_nx = W;
+    popup->fft_ny = H;
+
+    /* Global mean subtraction */
+    double mean_val = 0.0;
+    for (int i = 0; i < W * H; i++)
+        mean_val += current_slice_data[i];
+    mean_val /= (double)(W * H);
+
+    /* Determine physical domain size for the primary (horizontal) slice axis */
+    int axis = pf->slice_axis;
+    int ax1 = (axis == 0) ? 1 : 0;
+    double Lx = pf->prob_hi[ax1] - pf->prob_lo[ax1];
+    /* Note: For WK, we use the same k scale (based on Lx) for both spectra,
+       matching spectracam's approach of a single shared k axis */
+
+    /* E_x: average |FFT_row|² over all rows */
+    int kMaxX = W / 2;
+    double *Ex = (double *)calloc(kMaxX + 1, sizeof(double));
+    if (!Ex) return;
+
+    /* Allocate row buffers for FFT */
+    Fft2DComplex *row_buf = (Fft2DComplex *)malloc(W * sizeof(Fft2DComplex));
+    if (!row_buf) { free(Ex); return; }
+
+    /* Find next power of 2 >= W for zero-padded FFT */
+    int W_padded = 1;
+    while (W_padded < W) W_padded <<= 1;
+    Fft2DComplex *row_padded = (Fft2DComplex *)malloc(W_padded * sizeof(Fft2DComplex));
+    if (!row_padded) { free(Ex); free(row_buf); return; }
+
+    for (int y = 0; y < H; y++) {
+        /* Fill buffer with mean-subtracted row data, zero-pad */
+        for (int x = 0; x < W; x++) {
+            row_padded[x].r = current_slice_data[y * W + x] - mean_val;
+            row_padded[x].i = 0.0;
+        }
+        for (int x = W; x < W_padded; x++) {
+            row_padded[x].r = 0.0;
+            row_padded[x].i = 0.0;
+        }
+        fft1d_ct(row_padded, W_padded);
+        /* Accumulate power for first kMaxX bins (scaled to original W) */
+        for (int k = 1; k <= kMaxX; k++) {
+            int idx = (k * W_padded) / W;  /* Scale bin index */
+            if (idx < W_padded)
+                Ex[k] += row_padded[idx].r * row_padded[idx].r + row_padded[idx].i * row_padded[idx].i;
+        }
+    }
+    for (int k = 1; k <= kMaxX; k++) Ex[k] /= H;
+    free(row_padded);
+    free(row_buf);
+
+    /* E_y: average |FFT_col|² over all columns */
+    int kMaxY = H / 2;
+    double *Ey = (double *)calloc(kMaxY + 1, sizeof(double));
+    if (!Ey) { free(Ex); return; }
+
+    int H_padded = 1;
+    while (H_padded < H) H_padded <<= 1;
+    Fft2DComplex *col_padded = (Fft2DComplex *)malloc(H_padded * sizeof(Fft2DComplex));
+    if (!col_padded) { free(Ex); free(Ey); return; }
+
+    for (int x = 0; x < W; x++) {
+        for (int y = 0; y < H; y++) {
+            col_padded[y].r = current_slice_data[y * W + x] - mean_val;
+            col_padded[y].i = 0.0;
+        }
+        for (int y = H; y < H_padded; y++) {
+            col_padded[y].r = 0.0;
+            col_padded[y].i = 0.0;
+        }
+        fft1d_ct(col_padded, H_padded);
+        for (int k = 1; k <= kMaxY; k++) {
+            int idx = (k * H_padded) / H;
+            if (idx < H_padded)
+                Ey[k] += col_padded[idx].r * col_padded[idx].r + col_padded[idx].i * col_padded[idx].i;
+        }
+    }
+    for (int k = 1; k <= kMaxY; k++) Ey[k] /= W;
+    free(col_padded);
+
+    /* Store results with physical wavenumber */
+    if (popup->k_vals) free(popup->k_vals);
+    if (popup->e_vals) free(popup->e_vals);
+    if (popup->e_vals_y) free(popup->e_vals_y);
+
+    popup->k_vals = (double *)malloc((kMaxX + 1) * sizeof(double));
+    popup->e_vals = (double *)malloc((kMaxX + 1) * sizeof(double));
+    popup->e_vals_y = (double *)malloc((kMaxY + 1) * sizeof(double));
+    popup->n_bins = 0;
+    popup->n_bins_y = 0;
+
+    /* Physical wavenumber: k = 2π * index / L */
+    for (int k = 1; k <= kMaxX; k++) {
+        if (Ex[k] > 0.0) {
+            popup->k_vals[popup->n_bins] = 2.0 * M_PI * k / Lx;
+            popup->e_vals[popup->n_bins] = Ex[k];
+            popup->n_bins++;
+        }
+    }
+    for (int k = 1; k <= kMaxY; k++) {
+        if (Ey[k] > 0.0) {
+            popup->e_vals_y[popup->n_bins_y] = Ey[k];
+            popup->n_bins_y++;
+        }
+    }
+
+    free(Ex);
+    free(Ey);
+}
+
+/* Recompute spectrum based on current method */
+static void recompute_fft_spectrum(FFTPopupData *popup) {
+    if (popup->method == 0) {
+        if (popup->e_vals_y) { free(popup->e_vals_y); popup->e_vals_y = NULL; }
+        popup->n_bins_y = 0;
+        compute_2dfft_spectrum(popup);
+    } else {
+        compute_wk_spectrum(popup);
+    }
+}
+
+/* Forward declaration for button callback */
+static void draw_fft_spectrum(FFTPopupData *popup);
+
+/* Method button callbacks */
+static void fft_method_fft2d_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    FFTPopupData *popup = (FFTPopupData *)client_data;
+    if (popup->method == 0) return;  /* Already selected */
+    popup->method = 0;
+    /* Update button labels to show selection */
+    XtVaSetValues(popup->method_fft_btn, XtNlabel, "[2D FFT]", NULL);
+    XtVaSetValues(popup->method_wk_btn, XtNlabel, "Wiener-Khinchin", NULL);
+    recompute_fft_spectrum(popup);
+    draw_fft_spectrum(popup);
+}
+
+static void fft_method_wk_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    FFTPopupData *popup = (FFTPopupData *)client_data;
+    if (popup->method == 1) return;  /* Already selected */
+    popup->method = 1;
+    XtVaSetValues(popup->method_fft_btn, XtNlabel, "2D FFT", NULL);
+    XtVaSetValues(popup->method_wk_btn, XtNlabel, "[Wiener-Khinchin]", NULL);
+    recompute_fft_spectrum(popup);
+    draw_fft_spectrum(popup);
+}
+
 static void draw_fft_spectrum(FFTPopupData *popup) {
     if (!popup || !popup->canvas || !XtIsRealized(popup->canvas)) return;
     if (popup->n_bins < 2) return;
@@ -6193,6 +6358,17 @@ static void draw_fft_spectrum(FFTPopupData *popup) {
             if (lk > lkmax) lkmax = lk;
             if (le < lemin) lemin = le;
             if (le > lemax) lemax = le;
+        }
+    }
+    /* Include WK vertical spectrum in range calculation */
+    if (popup->method == 1 && popup->e_vals_y && popup->n_bins_y > 0) {
+        int n_y = (popup->n_bins_y < popup->n_bins) ? popup->n_bins_y : popup->n_bins;
+        for (int b = 0; b < n_y; b++) {
+            if (popup->e_vals_y[b] > 0.0) {
+                double le = log10(popup->e_vals_y[b]);
+                if (le < lemin) lemin = le;
+                if (le > lemax) lemax = le;
+            }
         }
     }
     if (lkmax <= lkmin || lemax <= lemin) { XFreeGC(display, gc2); return; }
@@ -6241,7 +6417,14 @@ static void draw_fft_spectrum(FFTPopupData *popup) {
         XDrawString(display, win, gc2, 2, pt + ph / 2, yl, strlen(yl));
     }
 
-    /* Plot spectrum */
+    /* Plot primary spectrum (cyan for both methods) */
+    XColor cyan_c, dummy_c;
+    unsigned long cyan_pix = BlackPixel(display, screen);
+    if (XAllocNamedColor(display, DefaultColormap(display, screen), "#00c8e0", &cyan_c, &dummy_c))
+        cyan_pix = cyan_c.pixel;
+    XSetForeground(display, gc2, cyan_pix);
+    XSetLineAttributes(display, gc2, 2, LineSolid, CapButt, JoinMiter);
+
     int px = -1, py = -1;
     for (int b = 0; b < popup->n_bins; b++) {
         if (popup->k_vals[b] > 0.0 && popup->e_vals[b] > 0.0) {
@@ -6254,48 +6437,89 @@ static void draw_fft_spectrum(FFTPopupData *popup) {
         }
     }
 
-    /* Kolmogorov -5/3 reference line (red dashed), crossing the data center */
-    {
-        double lk_mid = (lkmin + lkmax) * 0.5;
-        double le_mid = (lemin + lemax) * 0.5;
-        /* Line: log(E) = le_mid - (5/3)*(log(k) - lk_mid) */
-        double C53 = le_mid + (5.0 / 3.0) * lk_mid;
-        double slope = -5.0 / 3.0;
+    /* For Wiener-Khinchin, also plot vertical spectrum (green) */
+    if (popup->method == 1 && popup->e_vals_y && popup->n_bins_y > 0) {
+        XColor green_c;
+        unsigned long green_pix = BlackPixel(display, screen);
+        if (XAllocNamedColor(display, DefaultColormap(display, screen), "#4ade80", &green_c, &dummy_c))
+            green_pix = green_c.pixel;
+        XSetForeground(display, gc2, green_pix);
 
-        /* Endpoints at the k range boundaries */
-        double lk1 = lkmin, lk2 = lkmax;
-        double le1 = C53 + slope * lk1;
-        double le2 = C53 + slope * lk2;
-
-        /* Clip to E range (adjust k accordingly) */
-        if (le1 > lemax) { lk1 = (lemax - C53) / slope; le1 = lemax; }
-        else if (le1 < lemin) { lk1 = (lemin - C53) / slope; le1 = lemin; }
-        if (le2 > lemax) { lk2 = (lemax - C53) / slope; le2 = lemax; }
-        else if (le2 < lemin) { lk2 = (lemin - C53) / slope; le2 = lemin; }
-
-        if (lk1 < lk2) {
-            XColor rc, dummy2;
-            unsigned long rpix = BlackPixel(display, screen);
-            if (XAllocNamedColor(display, DefaultColormap(display, screen),
-                                 "red", &rc, &dummy2))
-                rpix = rc.pixel;
-            XSetForeground(display, gc2, rpix);
-            char dash_list[] = {8, 4};
-            XSetLineAttributes(display, gc2, 2, LineOnOffDash, CapButt, JoinMiter);
-            XSetDashes(display, gc2, 0, dash_list, 2);
-            XDrawLine(display, win, gc2,
-                      FFT_K2X(lk1), FFT_E2Y(le1),
-                      FFT_K2X(lk2), FFT_E2Y(le2));
-            /* Label */
-            if (font) {
-                const char *klbl = "k^(-5/3)";
-                int kx = FFT_K2X(lk_mid) + 6;
-                int ky = FFT_E2Y(le_mid) - 6;
-                if (kx > pl && kx < pr && ky > pt && ky < pb)
-                    XDrawString(display, win, gc2, kx, ky, klbl, strlen(klbl));
+        px = -1; py = -1;
+        /* For WK vertical, use same k_vals array (they share wavenumber scale) */
+        int n_y = (popup->n_bins_y < popup->n_bins) ? popup->n_bins_y : popup->n_bins;
+        for (int b = 0; b < n_y; b++) {
+            if (popup->k_vals[b] > 0.0 && popup->e_vals_y[b] > 0.0) {
+                int xp = FFT_K2X(log10(popup->k_vals[b]));
+                int yp = FFT_E2Y(log10(popup->e_vals_y[b]));
+                if (xp >= pl && xp <= pr && yp >= pt && yp <= pb) {
+                    if (px >= 0) XDrawLine(display, win, gc2, px, py, xp, yp);
+                    px = xp;  py = yp;
+                } else { px = -1;  py = -1; }
             }
         }
     }
+
+    /* Reference slope lines anchored at ~1/5 of the spectrum (left-middle region) */
+    int anchor_idx = popup->n_bins / 5;  /* 1/5 of the way through */
+    if (anchor_idx < 1) anchor_idx = 1;
+    if (anchor_idx >= popup->n_bins) anchor_idx = popup->n_bins - 1;
+    double lk_anchor = log10(popup->k_vals[anchor_idx]);
+    double le_anchor = log10(popup->e_vals[anchor_idx]);
+    /* Ensure valid anchor values */
+    if (popup->k_vals[anchor_idx] <= 0.0 || popup->e_vals[anchor_idx] <= 0.0) {
+        /* Fallback: search for first valid point near 1/3 */
+        lk_anchor = (lkmin + lkmax) * 0.5;
+        le_anchor = (lemin + lemax) * 0.5;
+        for (int b = anchor_idx; b < popup->n_bins && b < anchor_idx + 10; b++) {
+            if (popup->k_vals[b] > 0.0 && popup->e_vals[b] > 0.0) {
+                lk_anchor = log10(popup->k_vals[b]);
+                le_anchor = log10(popup->e_vals[b]);
+                break;
+            }
+        }
+    }
+
+    /* Helper to draw a reference line */
+    #define DRAW_REF_LINE(slope, r, g, b, dash1, dash2, label_str, label_offset) do { \
+        double C = le_anchor - (slope) * lk_anchor; \
+        double lk1 = lkmin, lk2 = lkmax; \
+        double le1 = C + (slope) * lk1; \
+        double le2 = C + (slope) * lk2; \
+        if (le1 > lemax) { lk1 = (lemax - C) / (slope); le1 = lemax; } \
+        else if (le1 < lemin) { lk1 = (lemin - C) / (slope); le1 = lemin; } \
+        if (le2 > lemax) { lk2 = (lemax - C) / (slope); le2 = lemax; } \
+        else if (le2 < lemin) { lk2 = (lemin - C) / (slope); le2 = lemin; } \
+        if (lk1 < lk2) { \
+            XColor rc; unsigned long rpix = BlackPixel(display, screen); \
+            rc.red = (r) << 8; rc.green = (g) << 8; rc.blue = (b) << 8; rc.flags = DoRed | DoGreen | DoBlue; \
+            if (XAllocColor(display, DefaultColormap(display, screen), &rc)) rpix = rc.pixel; \
+            XSetForeground(display, gc2, rpix); \
+            char dash_list[] = {dash1, dash2}; \
+            XSetLineAttributes(display, gc2, 2, LineOnOffDash, CapButt, JoinMiter); \
+            XSetDashes(display, gc2, 0, dash_list, 2); \
+            XDrawLine(display, win, gc2, FFT_K2X(lk1), FFT_E2Y(le1), FFT_K2X(lk2), FFT_E2Y(le2)); \
+            if (font) { \
+                double lk_lbl = lk2 - (lk2 - lk1) * 0.15; /* 85% along the line */ \
+                double le_lbl = C + (slope) * lk_lbl; \
+                int kx = FFT_K2X(lk_lbl) + 4; /* Right of this point */ \
+                int ky = FFT_E2Y(le_lbl) + 2 + (label_offset); /* Above the line */ \
+                if (kx > pl + 20 && kx < pr - 5 && ky > pt + 5 && ky < pb - 5) \
+                    XDrawString(display, win, gc2, kx, ky, label_str, strlen(label_str)); \
+            } \
+        } \
+    } while(0)
+
+    /* k^(-1): Purple #a78bfa (167, 139, 250) - Batchelor */
+    DRAW_REF_LINE(-1.0, 167, 139, 250, 4, 4, "k^(-1)", -10);
+
+    /* k^(-5/3): Orange #f0a500 (240, 165, 0) - Kolmogorov */
+    DRAW_REF_LINE(-5.0/3.0, 240, 165, 0, 8, 5, "k^(-5/3)", -10);
+
+    /* k^(-3): Hot pink #ff69b4 (255, 105, 180) - Kraichnan */
+    DRAW_REF_LINE(-3.0, 255, 105, 180, 6, 4, "k^(-3)", -10);
+
+    #undef DRAW_REF_LINE
 
 #undef FFT_K2X
 #undef FFT_E2Y
@@ -6309,29 +6533,66 @@ static void draw_fft_spectrum(FFTPopupData *popup) {
         int sep_y = pb + 50;
         XDrawLine(display, win, gc2, pl, sep_y, pr, sep_y);
 
-        char note[256];
+        char note[512];
         int ny = sep_y + 14;
-        const int line_h = 15;
+        const int line_h = 14;
+        int max_text_width = pr - pl - 10;
+
+        /* Helper macro to draw wrapped text */
+        #define DRAW_WRAPPED(text) do { \
+            const char *src = (text); \
+            int src_len = strlen(src); \
+            int start = 0; \
+            while (start < src_len) { \
+                int end = src_len; \
+                while (end > start && XTextWidth(font, src + start, end - start) > max_text_width) { \
+                    /* Find last space before max width */ \
+                    int last_space = end; \
+                    for (int i = end - 1; i > start; i--) { \
+                        if (src[i] == ' ') { last_space = i; break; } \
+                    } \
+                    end = (last_space > start) ? last_space : end - 1; \
+                } \
+                XDrawString(display, win, gc2, pl, ny, src + start, end - start); \
+                ny += line_h; \
+                start = end; \
+                while (start < src_len && src[start] == ' ') start++; \
+            } \
+        } while(0)
+
+        if (popup->method == 0) {
+            snprintf(note, sizeof(note),
+                     "Method: 2D Cooley-Tukey FFT on '%s', "
+                     "centered square crop to %d x %d (power-of-2), "
+                     "Hann windowed, mean subtracted.",
+                     (pf && pf->current_var >= 0) ? pf->variables[pf->current_var] : "field",
+                     popup->fft_nx, popup->fft_ny);
+            DRAW_WRAPPED(note);
+
+            snprintf(note, sizeof(note),
+                     "E(k) = sum|F(kx,ky)|^2 / (Nx*Ny)^2 "
+                     "summed over annular shells of physical wavenumber k.");
+            DRAW_WRAPPED(note);
+        } else {
+            snprintf(note, sizeof(note),
+                     "Method: Wiener-Khinchin (Ma et al. 2024) on '%s', "
+                     "full %d x %d slice, mean subtracted.",
+                     (pf && pf->current_var >= 0) ? pf->variables[pf->current_var] : "field",
+                     popup->fft_nx, popup->fft_ny);
+            DRAW_WRAPPED(note);
+
+            snprintf(note, sizeof(note),
+                     "Cyan: E_x(k) horizontal avg, Green: E_y(k) vertical avg. "
+                     "Overlap indicates isotropy.");
+            DRAW_WRAPPED(note);
+        }
 
         snprintf(note, sizeof(note),
-                 "Method: 2D Cooley-Tukey FFT on '%s', "
-                 "truncated to %d x %d (largest power-of-2 per axis), "
-                 "Hann windowed, mean subtracted.",
-                 (pf && pf->current_var >= 0) ? pf->variables[pf->current_var] : "field",
-                 popup->fft_nx, popup->fft_ny);
-        XDrawString(display, win, gc2, pl, ny, note, strlen(note));
-        ny += line_h;
+                 "Ref. slopes: purple k^(-1) Batchelor, "
+                 "orange k^(-5/3) Kolmogorov, pink k^(-3) Kraichnan.");
+        DRAW_WRAPPED(note);
 
-        snprintf(note, sizeof(note),
-                 "E(k) = sum|F(kx,ky)|^2 / (Nx*Ny)^2 "
-                 "summed over annular shells of physical wavenumber k (rad / plotfile length unit).");
-        XDrawString(display, win, gc2, pl, ny, note, strlen(note));
-        ny += line_h;
-
-        snprintf(note, sizeof(note),
-                 "Dashed red: Kolmogorov k^(-5/3) reference line "
-                 "anchored to the spectrum midpoint.");
-        XDrawString(display, win, gc2, pl, ny, note, strlen(note));
+        #undef DRAW_WRAPPED
     }
 
     XFreeGC(display, gc2);
@@ -6347,18 +6608,38 @@ static void fft2d_canvas_expose_handler(Widget w, XtPointer client_data,
 void show_2dfft(PlotfileData *pf) {
     FFTPopupData *popup = (FFTPopupData *)calloc(1, sizeof(FFTPopupData));
     popup->pf = pf;
+    popup->method = 0;  /* Default to 2D FFT */
     compute_2dfft_spectrum(popup);
 
-    Widget sh = XtVaCreatePopupShell("2D FFT Spectrum",
+    /* More square aspect ratio (spectracam style) */
+    Widget sh = XtVaCreatePopupShell("Energy Spectrum",
         transientShellWidgetClass, toplevel,
-        XtNwidth, 960, XtNheight, 580, NULL);
+        XtNwidth, 760, XtNheight, 720, NULL);
     popup->shell = sh;
 
     Widget frm = XtVaCreateManagedWidget("form", formWidgetClass, sh, NULL);
 
+    /* Method selection buttons */
+    Widget method_label = XtVaCreateManagedWidget("Method:",
+        labelWidgetClass, frm,
+        XtNborderWidth, 0, NULL);
+
+    Widget fft_btn = XtVaCreateManagedWidget("[2D FFT]",
+        commandWidgetClass, frm,
+        XtNfromHoriz, method_label, NULL);
+    XtAddCallback(fft_btn, XtNcallback, fft_method_fft2d_callback, popup);
+    popup->method_fft_btn = fft_btn;
+
+    Widget wk_btn = XtVaCreateManagedWidget("Wiener-Khinchin",
+        commandWidgetClass, frm,
+        XtNfromHoriz, fft_btn, NULL);
+    XtAddCallback(wk_btn, XtNcallback, fft_method_wk_callback, popup);
+    popup->method_wk_btn = wk_btn;
+
     Widget cv = XtVaCreateManagedWidget("fftCanvas",
         simpleWidgetClass, frm,
-        XtNwidth, 940, XtNheight, 500, XtNborderWidth, 1, NULL);
+        XtNwidth, 740, XtNheight, 620, XtNborderWidth, 1,
+        XtNfromVert, method_label, NULL);
     popup->canvas = cv;
     XtAddEventHandler(cv, ExposureMask, False, fft2d_canvas_expose_handler, popup);
 
