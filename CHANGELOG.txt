@@ -1,6 +1,12 @@
 Changelog
 =========
 
+v0.5.5
+------
+- SDM/SBM Settings: Add X-axis limits (X-min, X-max) in Settings dialog
+- SDM mode: Add PDF toggle for probability density function normalization
+- SDM/SBM info labels: Display total sum of all bins (e.g., total mass, total count)
+
 v0.5.4
 ------
 - Add FFT button: 2D energy spectrum popup with Kolmogorov k^(-5/3) reference line

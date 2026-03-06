@@ -136,6 +136,9 @@ typedef struct {
     int log_bin;            /* 0=linear bin width, 1=log-spaced bins */
     double cutoff_radius;   /* Cutoff in um (0 = no cutoff) */
     double custom_bin_width; /* Custom bin width in um (0 = auto/Sturges) */
+    double xlim_min;        /* X-axis min in um (0 = auto) */
+    double xlim_max;        /* X-axis max in um (0 = auto) */
+    int pdf_mode;           /* PDF mode: normalize by sum and bin width */
     /* Per-grid info from particle Header */
     int n_grids;
     int grid_file_num[MAX_BOXES];
@@ -166,6 +169,8 @@ typedef struct {
     int log_x;                          /* Log x-axis toggle */
     int log_y;                          /* Log y-axis toggle */
     int pdf_mode;                       /* PDF mode: normalize by sum and bin width */
+    double xlim_min;                    /* X-axis min in um (0 = auto) */
+    double xlim_max;                    /* X-axis max in um (0 = auto) */
     char plotfile_dir[MAX_PATH];
 } SBMData;
 
@@ -232,6 +237,7 @@ typedef struct {
     int n_bins;
     double count_max;
     double bin_min, bin_max;
+    double total;         /* Total sum of all bin values (before PDF normalization) */
     char title[128];
     char xlabel[64];
     double mean, std, skewness;
@@ -248,9 +254,11 @@ Window sdm_canvas = 0;
 HistogramData *sdm_hist_data = NULL;  /* Persistent histogram data for SDM canvas */
 Widget sdm_settings_text_cutoff = NULL;
 Widget sdm_settings_text_binwidth = NULL;
+Widget sdm_settings_text_xlim_min = NULL;
+Widget sdm_settings_text_xlim_max = NULL;
 int sdm_dialog_active = 0;
 Widget sdm_active_text_widget = NULL;
-int sdm_active_field = 0;  /* 0=cutoff, 1=binwidth */
+int sdm_active_field = 0;  /* 0=cutoff, 1=binwidth, 2=xlim_min, 3=xlim_max */
 Widget sdm_dialog_shell = NULL;
 Widget overlay_button = NULL;  /* Overlay toggle button */
 
@@ -262,6 +270,12 @@ Widget sbm_metric_buttons[SBM_N_METRICS];
 Widget sbm_info_label = NULL;
 Window sbm_canvas = 0;
 HistogramData *sbm_hist_data = NULL;  /* Persistent histogram data for SBM canvas */
+Widget sbm_settings_text_xlim_min = NULL;
+Widget sbm_settings_text_xlim_max = NULL;
+int sbm_dialog_active = 0;
+Widget sbm_active_text_widget = NULL;
+int sbm_active_field = 0;  /* 0=xlim_min, 1=xlim_max */
+Widget sbm_dialog_shell = NULL;
 Widget map_dialog_shell = NULL;
 Widget map_unavailable_shell = NULL;
 Widget map_unavailable_label = NULL;
@@ -399,6 +413,7 @@ void update_sdm_info_label(ParticleData *pd, const char *plotfile_dir);
 void sdm_logx_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void sdm_logy_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void sdm_logbin_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void sdm_pdf_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void sdm_settings_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void sdm_settings_apply_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void sdm_settings_close_callback(Widget w, XtPointer client_data, XtPointer call_data);
@@ -422,6 +437,9 @@ void sbm_switch_timestep(SBMData *sbm, int new_timestep);
 int scan_sbm_timesteps(const char *base_dir, const char *prefix);
 void sbm_time_nav_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void sbm_canvas_expose_callback(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch);
+void sbm_settings_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void sbm_settings_apply_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void sbm_settings_close_callback(Widget w, XtPointer client_data, XtPointer call_data);
 
 /* Global pointer for callbacks */
 PlotfileData *global_pf = NULL;
@@ -6781,8 +6799,9 @@ void draw_sdm_histogram(Display *dpy, Window win, GC plot_gc, HistogramData *his
         log_xmax = (x_max > 0) ? log10(x_max) : 0;
         if (log_xmin >= log_xmax) log_xmin = log_xmax - 1;
     } else {
-        /* In linear mode, start x-axis from 0 */
-        x_min = 0;
+        /* In linear mode, start x-axis from 0 unless user specified a min */
+        /* hist->bin_min will be non-zero if user set xlim_min */
+        if (x_min <= 0) x_min = 0;
     }
 
     /* Draw X-axis ticks */
@@ -8367,10 +8386,12 @@ void compute_sdm_histogram(ParticleData *pd, HistogramData *hist) {
         }
     }
 
-    /* Find max for scaling */
+    /* Find max and total for scaling */
     double count_max = 0;
+    double total_sum = 0;
     for (int i = 0; i < n_bins; i++) {
         if (display_values[i] > count_max) count_max = display_values[i];
+        total_sum += display_values[i];
     }
     if (count_max == 0) count_max = 1;
 
@@ -8410,13 +8431,47 @@ void compute_sdm_histogram(ParticleData *pd, HistogramData *hist) {
     hist->bin_edges = bin_edges;
     hist->n_bins = n_bins;
     hist->count_max = count_max;
+    hist->total = total_sum;
     hist->bin_min = rmin;
     hist->bin_max = rmax;
+
+    /* Apply xlim overrides if set */
+    if (pd->xlim_min > 0) hist->bin_min = pd->xlim_min;
+    if (pd->xlim_max > 0) hist->bin_max = pd->xlim_max;
+
+    /* Apply PDF normalization if enabled: PDF = value / (total_sum * bin_width) */
+    /* This makes the integral over radius equal to 1 */
+    if (pd->pdf_mode) {
+        double total_sum = 0;
+        for (int i = 0; i < n_bins; i++) {
+            total_sum += display_values[i];
+        }
+        if (total_sum > 0) {
+            count_max = 0;
+            for (int i = 0; i < n_bins; i++) {
+                double bw = bin_edges[i + 1] - bin_edges[i];
+                if (bw > 0) {
+                    hist->bin_counts[i] = display_values[i] / (total_sum * bw);
+                } else {
+                    hist->bin_counts[i] = 0;
+                }
+                if (hist->bin_counts[i] > count_max) count_max = hist->bin_counts[i];
+            }
+            hist->count_max = (count_max > 0) ? count_max : 1.0;
+        }
+    }
+
     hist->mean = mean;
     hist->std = std;
     hist->skewness = skewness;
     hist->kurtosis = kurtosis;
-    snprintf(hist->title, sizeof(hist->title), "%s", sdm_metric_titles[pd->current_metric]);
+
+    /* Set title */
+    if (pd->pdf_mode) {
+        snprintf(hist->title, sizeof(hist->title), "%s (PDF)", sdm_metric_titles[pd->current_metric]);
+    } else {
+        snprintf(hist->title, sizeof(hist->title), "%s", sdm_metric_titles[pd->current_metric]);
+    }
 
     /* Use xlabel to carry cutoff info for second stats line */
     if (pd->cutoff_radius > 0) {
@@ -8449,7 +8504,13 @@ void render_sdm_histogram(ParticleData *pd) {
     Dimension width, height;
     XtVaGetValues(sdm_canvas_widget, XtNwidth, &width, XtNheight, &height, NULL);
 
-    const char *ylabel = sdm_metric_ylabels[pd->current_metric];
+    /* Use PDF label when in PDF mode */
+    const char *ylabel;
+    if (pd->pdf_mode) {
+        ylabel = "Probability density (1/um)";
+    } else {
+        ylabel = sdm_metric_ylabels[pd->current_metric];
+    }
 
     GC plot_gc = XCreateGC(display, sdm_canvas, 0, NULL);
     if (font) XSetFont(display, plot_gc, font->fid);
@@ -8462,16 +8523,33 @@ void render_sdm_histogram(ParticleData *pd) {
 void update_sdm_info_label(ParticleData *pd, const char *plotfile_dir) {
     if (!sdm_info_label || !pd) return;
     char text[512];
+    char total_str[64];
     const char *basename = strrchr(plotfile_dir, '/');
     basename = basename ? basename + 1 : plotfile_dir;
 
+    const char *pdf_str = pd->pdf_mode ? " (PDF)" : "";
+
+    /* Format total based on magnitude */
+    double total = sdm_hist_data ? sdm_hist_data->total : 0;
+    if (total >= 1e9) {
+        snprintf(total_str, sizeof(total_str), "%.3e", total);
+    } else if (total >= 1e6) {
+        snprintf(total_str, sizeof(total_str), "%.2fM", total / 1e6);
+    } else if (total >= 1e3) {
+        snprintf(total_str, sizeof(total_str), "%.2fK", total / 1e3);
+    } else if (total >= 1.0) {
+        snprintf(total_str, sizeof(total_str), "%.2f", total);
+    } else {
+        snprintf(total_str, sizeof(total_str), "%.3e", total);
+    }
+
     if (n_timesteps > 1) {
-        snprintf(text, sizeof(text), "SDM: %s  |  Particles: %d  |  Metric: %s  |  Step %d/%d",
-                 basename, pd->n_particles, sdm_metric_labels[pd->current_metric],
+        snprintf(text, sizeof(text), "SDM: %s  |  Metric: %s%s  |  Total: %s  |  Step %d/%d",
+                 basename, sdm_metric_labels[pd->current_metric], pdf_str, total_str,
                  current_timestep + 1, n_timesteps);
     } else {
-        snprintf(text, sizeof(text), "SDM: %s  |  Particles: %d  |  Metric: %s",
-                 basename, pd->n_particles, sdm_metric_labels[pd->current_metric]);
+        snprintf(text, sizeof(text), "SDM: %s  |  Metric: %s%s  |  Total: %s",
+                 basename, sdm_metric_labels[pd->current_metric], pdf_str, total_str);
     }
 
     Arg args[1];
@@ -8549,12 +8627,20 @@ void sdm_logbin_callback(Widget w, XtPointer client_data, XtPointer call_data) {
     render_sdm_histogram(global_pd);
 }
 
+/* SDM PDF toggle callback */
+void sdm_pdf_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    if (!global_pd) return;
+    global_pd->pdf_mode = !global_pd->pdf_mode;
+    render_sdm_histogram(global_pd);
+    update_sdm_info_label(global_pd, timestep_paths[current_timestep]);
+}
+
 /* SDM Settings apply callback */
 void sdm_settings_apply_callback(Widget w, XtPointer client_data, XtPointer call_data) {
     if (!global_pd) return;
 
     Arg args[1];
-    String cutoff_str, binwidth_str;
+    String cutoff_str, binwidth_str, xlim_min_str, xlim_max_str;
 
     if (sdm_settings_text_cutoff) {
         XtSetArg(args[0], XtNstring, &cutoff_str);
@@ -8574,6 +8660,24 @@ void sdm_settings_apply_callback(Widget w, XtPointer client_data, XtPointer call
             global_pd->custom_bin_width = 0;
     }
 
+    if (sdm_settings_text_xlim_min) {
+        XtSetArg(args[0], XtNstring, &xlim_min_str);
+        XtGetValues(sdm_settings_text_xlim_min, args, 1);
+        if (xlim_min_str && strlen(xlim_min_str) > 0)
+            global_pd->xlim_min = atof(xlim_min_str);
+        else
+            global_pd->xlim_min = 0;
+    }
+
+    if (sdm_settings_text_xlim_max) {
+        XtSetArg(args[0], XtNstring, &xlim_max_str);
+        XtGetValues(sdm_settings_text_xlim_max, args, 1);
+        if (xlim_max_str && strlen(xlim_max_str) > 0)
+            global_pd->xlim_max = atof(xlim_max_str);
+        else
+            global_pd->xlim_max = 0;
+    }
+
     /* Close dialog */
     if (sdm_dialog_shell) {
         XtPopdown(sdm_dialog_shell);
@@ -8584,6 +8688,8 @@ void sdm_settings_apply_callback(Widget w, XtPointer client_data, XtPointer call
     sdm_active_text_widget = NULL;
     sdm_settings_text_cutoff = NULL;
     sdm_settings_text_binwidth = NULL;
+    sdm_settings_text_xlim_min = NULL;
+    sdm_settings_text_xlim_max = NULL;
 
     render_sdm_histogram(global_pd);
     update_sdm_info_label(global_pd, timestep_paths[current_timestep]);
@@ -8600,6 +8706,8 @@ void sdm_settings_close_callback(Widget w, XtPointer client_data, XtPointer call
     sdm_active_text_widget = NULL;
     sdm_settings_text_cutoff = NULL;
     sdm_settings_text_binwidth = NULL;
+    sdm_settings_text_xlim_min = NULL;
+    sdm_settings_text_xlim_max = NULL;
 }
 
 /* SDM Settings cutoff focus callback */
@@ -8616,22 +8724,31 @@ void sdm_binwidth_focus_callback(Widget w, XtPointer client_data, XtPointer call
 
 /* SDM Settings text widget click-to-focus event handler */
 void sdm_text_click_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch) {
-    if (event->type == ButtonPress) {
-        /* Set keyboard focus to clicked widget */
-        Widget shell = XtParent(XtParent(w));  /* Get shell widget */
-        XtSetKeyboardFocus(shell, w);
-        Time time_val = event->xbutton.time;
-        XtCallAcceptFocus(w, &time_val);
-
-        /* Update active widget tracking */
-        if (w == sdm_settings_text_cutoff) {
-            sdm_active_text_widget = sdm_settings_text_cutoff;
-            sdm_active_field = 0;
-        } else if (w == sdm_settings_text_binwidth) {
-            sdm_active_text_widget = sdm_settings_text_binwidth;
-            sdm_active_field = 1;
-        }
+    if (event->type != ButtonPress || !sdm_dialog_shell) {
+        *continue_dispatch = True;
+        return;
     }
+
+    /* Set keyboard focus to clicked widget using the global dialog shell */
+    XtSetKeyboardFocus(sdm_dialog_shell, w);
+    Time time_val = CurrentTime;
+    XtCallAcceptFocus(w, &time_val);
+
+    /* Also set X input focus directly */
+    XSetInputFocus(display, XtWindow(w), RevertToParent, CurrentTime);
+
+    /* Update active widget tracking */
+    sdm_active_text_widget = w;
+    if (w == sdm_settings_text_cutoff) {
+        sdm_active_field = 0;
+    } else if (w == sdm_settings_text_binwidth) {
+        sdm_active_field = 1;
+    } else if (w == sdm_settings_text_xlim_min) {
+        sdm_active_field = 2;
+    } else if (w == sdm_settings_text_xlim_max) {
+        sdm_active_field = 3;
+    }
+
     *continue_dispatch = True;  /* Allow normal text widget processing */
 }
 
@@ -8640,7 +8757,7 @@ void sdm_settings_button_callback(Widget w, XtPointer client_data, XtPointer cal
     Arg args[10];
     int n;
     Widget form_w, label, button_w;
-    char cutoff_str[64], binwidth_str[64];
+    char cutoff_str[64], binwidth_str[64], xlim_min_str[64], xlim_max_str[64];
 
     /* Format current values */
     if (global_pd && global_pd->cutoff_radius > 0)
@@ -8652,6 +8769,16 @@ void sdm_settings_button_callback(Widget w, XtPointer client_data, XtPointer cal
         snprintf(binwidth_str, sizeof(binwidth_str), "%.4f", global_pd->custom_bin_width);
     else
         binwidth_str[0] = '\0';
+
+    if (global_pd && global_pd->xlim_min > 0)
+        snprintf(xlim_min_str, sizeof(xlim_min_str), "%.4f", global_pd->xlim_min);
+    else
+        xlim_min_str[0] = '\0';
+
+    if (global_pd && global_pd->xlim_max > 0)
+        snprintf(xlim_max_str, sizeof(xlim_max_str), "%.4f", global_pd->xlim_max);
+    else
+        xlim_max_str[0] = '\0';
 
     n = 0;
     XtSetArg(args[n], XtNtitle, "SDM Settings"); n++;
@@ -8700,29 +8827,66 @@ void sdm_settings_button_callback(Widget w, XtPointer client_data, XtPointer cal
     sdm_settings_text_binwidth = XtCreateManagedWidget("bwInput", asciiTextWidgetClass, form_w, args, n);
     XtAddEventHandler(sdm_settings_text_binwidth, ButtonPressMask, False, sdm_text_click_handler, NULL);
 
-    /* Apply button */
+    /* X-lim min label */
     n = 0;
     XtSetArg(args[n], XtNfromVert, bw_label); n++;
+    XtSetArg(args[n], XtNlabel, "X-min (um):"); n++;
+    XtSetArg(args[n], XtNborderWidth, 0); n++;
+    Widget xlim_min_label = XtCreateManagedWidget("xlimMinLabel", labelWidgetClass, form_w, args, n);
+
+    /* X-lim min text input */
+    n = 0;
+    XtSetArg(args[n], XtNfromVert, bw_label); n++;
+    XtSetArg(args[n], XtNfromHoriz, xlim_min_label); n++;
+    XtSetArg(args[n], XtNwidth, 120); n++;
+    XtSetArg(args[n], XtNeditType, XawtextEdit); n++;
+    XtSetArg(args[n], XtNstring, xlim_min_str); n++;
+    sdm_settings_text_xlim_min = XtCreateManagedWidget("xlimMinInput", asciiTextWidgetClass, form_w, args, n);
+    XtAddEventHandler(sdm_settings_text_xlim_min, ButtonPressMask, False, sdm_text_click_handler, NULL);
+
+    /* X-lim max label */
+    n = 0;
+    XtSetArg(args[n], XtNfromVert, xlim_min_label); n++;
+    XtSetArg(args[n], XtNlabel, "X-max (um):"); n++;
+    XtSetArg(args[n], XtNborderWidth, 0); n++;
+    Widget xlim_max_label = XtCreateManagedWidget("xlimMaxLabel", labelWidgetClass, form_w, args, n);
+
+    /* X-lim max text input */
+    n = 0;
+    XtSetArg(args[n], XtNfromVert, xlim_min_label); n++;
+    XtSetArg(args[n], XtNfromHoriz, xlim_max_label); n++;
+    XtSetArg(args[n], XtNwidth, 120); n++;
+    XtSetArg(args[n], XtNeditType, XawtextEdit); n++;
+    XtSetArg(args[n], XtNstring, xlim_max_str); n++;
+    sdm_settings_text_xlim_max = XtCreateManagedWidget("xlimMaxInput", asciiTextWidgetClass, form_w, args, n);
+    XtAddEventHandler(sdm_settings_text_xlim_max, ButtonPressMask, False, sdm_text_click_handler, NULL);
+
+    /* Apply button */
+    n = 0;
+    XtSetArg(args[n], XtNfromVert, xlim_max_label); n++;
     XtSetArg(args[n], XtNlabel, "Apply"); n++;
     button_w = XtCreateManagedWidget("apply", commandWidgetClass, form_w, args, n);
     XtAddCallback(button_w, XtNcallback, sdm_settings_apply_callback, NULL);
 
     /* Close button */
     n = 0;
-    XtSetArg(args[n], XtNfromVert, bw_label); n++;
+    XtSetArg(args[n], XtNfromVert, xlim_max_label); n++;
     XtSetArg(args[n], XtNfromHoriz, button_w); n++;
     XtSetArg(args[n], XtNlabel, "Close"); n++;
     button_w = XtCreateManagedWidget("close", commandWidgetClass, form_w, args, n);
     XtAddCallback(button_w, XtNcallback, sdm_settings_close_callback, NULL);
 
     XtRealizeWidget(sdm_dialog_shell);
-    XtPopup(sdm_dialog_shell, XtGrabExclusive);
+    XtPopup(sdm_dialog_shell, XtGrabNonexclusive);
 
     /* Set keyboard focus to cutoff text input */
     XtSetKeyboardFocus(sdm_dialog_shell, sdm_settings_text_cutoff);
     XSync(display, False);
     Time time_val = CurrentTime;
     XtCallAcceptFocus(sdm_settings_text_cutoff, &time_val);
+
+    /* Also set X input focus to the text widget's window */
+    XSetInputFocus(display, XtWindow(sdm_settings_text_cutoff), RevertToParent, CurrentTime);
 
     sdm_dialog_active = 1;
     sdm_active_text_widget = sdm_settings_text_cutoff;
@@ -8830,6 +8994,12 @@ void init_sdm_gui(ParticleData *pd, const char *plotfile_dir, int argc, char **a
     XtSetArg(args[n], XtNlabel, "LogBin"); n++;
     button = XtCreateManagedWidget("logBin", commandWidgetClass, options_box, args, n);
     XtAddCallback(button, XtNcallback, sdm_logbin_callback, NULL);
+
+    /* PDF toggle button */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "PDF"); n++;
+    button = XtCreateManagedWidget("pdf", commandWidgetClass, options_box, args, n);
+    XtAddCallback(button, XtNcallback, sdm_pdf_callback, NULL);
 
     /* Settings button */
     n = 0;
@@ -9090,14 +9260,17 @@ void compute_sbm_histogram(SBMData *sbm, HistogramData *hist) {
     hist->bin_edges = (double *)malloc((sbm->n_bins + 1) * sizeof(double));
     hist->n_bins = sbm->n_bins;
 
-    /* Copy bin values and centers */
+    /* Copy bin values and centers, compute max and total */
     double count_max = 0;
+    double total_sum = 0;
     for (int i = 0; i < sbm->n_bins; i++) {
         hist->bin_counts[i] = sbm->bin_values[i];
         hist->bin_centers[i] = sbm->bin_radius_um[i];
         if (sbm->bin_values[i] > count_max) count_max = sbm->bin_values[i];
+        total_sum += sbm->bin_values[i];
     }
     hist->count_max = (count_max > 0) ? count_max : 1.0;
+    hist->total = total_sum;
 
     /* Compute bin edges using geometric mean: edge[i] = sqrt(center[i-1] * center[i]) */
     /* For log-spaced bins, this gives proper boundaries */
@@ -9117,6 +9290,10 @@ void compute_sbm_histogram(SBMData *sbm, HistogramData *hist) {
     /* Set range from bin edges */
     hist->bin_min = hist->bin_edges[0];
     hist->bin_max = hist->bin_edges[sbm->n_bins];
+
+    /* Apply xlim overrides if set */
+    if (sbm->xlim_min > 0) hist->bin_min = sbm->xlim_min;
+    if (sbm->xlim_max > 0) hist->bin_max = sbm->xlim_max;
 
     /* Compute statistics (weighted by bin values) - use original values */
     double total_weight = 0, sum_r = 0, sum_r2 = 0;
@@ -9216,18 +9393,33 @@ void render_sbm_histogram(SBMData *sbm) {
 void update_sbm_info_label(SBMData *sbm, const char *plotfile_dir) {
     if (!sbm_info_label || !sbm) return;
     char text[512];
+    char total_str[64];
     const char *basename = strrchr(plotfile_dir, '/');
     basename = basename ? basename + 1 : plotfile_dir;
 
     const char *pdf_str = sbm->pdf_mode ? " (PDF)" : "";
 
+    /* Format total based on magnitude */
+    double total = sbm_hist_data ? sbm_hist_data->total : 0;
+    if (total >= 1e9) {
+        snprintf(total_str, sizeof(total_str), "%.3e", total);
+    } else if (total >= 1e6) {
+        snprintf(total_str, sizeof(total_str), "%.2fM", total / 1e6);
+    } else if (total >= 1e3) {
+        snprintf(total_str, sizeof(total_str), "%.2fK", total / 1e3);
+    } else if (total >= 1.0) {
+        snprintf(total_str, sizeof(total_str), "%.2f", total);
+    } else {
+        snprintf(total_str, sizeof(total_str), "%.3e", total);
+    }
+
     if (n_timesteps > 1) {
-        snprintf(text, sizeof(text), "SBM: %s  |  Bins: %d  |  Metric: %s%s  |  Step %d/%d",
-                 basename, sbm->n_bins, sbm_metric_labels[sbm->current_metric], pdf_str,
+        snprintf(text, sizeof(text), "SBM: %s  |  Metric: %s%s  |  Total: %s  |  Step %d/%d",
+                 basename, sbm_metric_labels[sbm->current_metric], pdf_str, total_str,
                  current_timestep + 1, n_timesteps);
     } else {
-        snprintf(text, sizeof(text), "SBM: %s  |  Bins: %d  |  Metric: %s%s",
-                 basename, sbm->n_bins, sbm_metric_labels[sbm->current_metric], pdf_str);
+        snprintf(text, sizeof(text), "SBM: %s  |  Metric: %s%s  |  Total: %s",
+                 basename, sbm_metric_labels[sbm->current_metric], pdf_str, total_str);
     }
 
     Arg args[1];
@@ -9266,6 +9458,169 @@ void sbm_pdf_callback(Widget w, XtPointer client_data, XtPointer call_data) {
     global_sbm->pdf_mode = !global_sbm->pdf_mode;
     render_sbm_histogram(global_sbm);
     update_sbm_info_label(global_sbm, timestep_paths[current_timestep]);
+}
+
+/* SBM Settings apply callback */
+void sbm_settings_apply_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    Arg args[1];
+    String xlim_min_str, xlim_max_str;
+
+    if (sbm_settings_text_xlim_min) {
+        XtSetArg(args[0], XtNstring, &xlim_min_str);
+        XtGetValues(sbm_settings_text_xlim_min, args, 1);
+        if (xlim_min_str && strlen(xlim_min_str) > 0)
+            global_sbm->xlim_min = atof(xlim_min_str);
+        else
+            global_sbm->xlim_min = 0;
+    }
+
+    if (sbm_settings_text_xlim_max) {
+        XtSetArg(args[0], XtNstring, &xlim_max_str);
+        XtGetValues(sbm_settings_text_xlim_max, args, 1);
+        if (xlim_max_str && strlen(xlim_max_str) > 0)
+            global_sbm->xlim_max = atof(xlim_max_str);
+        else
+            global_sbm->xlim_max = 0;
+    }
+
+    /* Re-render histogram with new settings */
+    render_sbm_histogram(global_sbm);
+}
+
+/* SBM Settings close callback */
+void sbm_settings_close_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    if (sbm_dialog_shell) {
+        XtPopdown(sbm_dialog_shell);
+        XtDestroyWidget(sbm_dialog_shell);
+        sbm_dialog_shell = NULL;
+    }
+    sbm_dialog_active = 0;
+    sbm_active_text_widget = NULL;
+    sbm_settings_text_xlim_min = NULL;
+    sbm_settings_text_xlim_max = NULL;
+}
+
+/* SBM Settings text widget click-to-focus event handler */
+void sbm_text_click_handler(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch) {
+    if (event->type != ButtonPress || !sbm_dialog_shell) {
+        *continue_dispatch = True;
+        return;
+    }
+
+    /* Set keyboard focus to clicked widget using the global dialog shell */
+    XtSetKeyboardFocus(sbm_dialog_shell, w);
+    Time time_val = CurrentTime;
+    XtCallAcceptFocus(w, &time_val);
+
+    /* Also set X input focus directly */
+    XSetInputFocus(display, XtWindow(w), RevertToParent, CurrentTime);
+
+    /* Update active widget tracking */
+    sbm_active_text_widget = w;
+    if (w == sbm_settings_text_xlim_min) {
+        sbm_active_field = 0;
+    } else if (w == sbm_settings_text_xlim_max) {
+        sbm_active_field = 1;
+    }
+
+    *continue_dispatch = True;  /* Allow normal text widget processing */
+}
+
+/* SBM Settings button callback - open popup dialog */
+void sbm_settings_button_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    Arg args[10];
+    int n;
+    Widget form_w, label, button_w;
+    char xlim_min_str[64], xlim_max_str[64];
+
+    /* Format current values */
+    if (global_sbm && global_sbm->xlim_min > 0)
+        snprintf(xlim_min_str, sizeof(xlim_min_str), "%.4f", global_sbm->xlim_min);
+    else
+        xlim_min_str[0] = '\0';
+
+    if (global_sbm && global_sbm->xlim_max > 0)
+        snprintf(xlim_max_str, sizeof(xlim_max_str), "%.4f", global_sbm->xlim_max);
+    else
+        xlim_max_str[0] = '\0';
+
+    n = 0;
+    XtSetArg(args[n], XtNtitle, "SBM Settings"); n++;
+    sbm_dialog_shell = XtCreatePopupShell("sbmSettings", transientShellWidgetClass, toplevel, args, n);
+
+    n = 0;
+    form_w = XtCreateManagedWidget("form", formWidgetClass, sbm_dialog_shell, args, n);
+
+    /* Title label */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "Histogram settings:"); n++;
+    XtSetArg(args[n], XtNborderWidth, 0); n++;
+    label = XtCreateManagedWidget("title", labelWidgetClass, form_w, args, n);
+
+    /* X-lim min label */
+    n = 0;
+    XtSetArg(args[n], XtNfromVert, label); n++;
+    XtSetArg(args[n], XtNlabel, "X-min (um):"); n++;
+    XtSetArg(args[n], XtNborderWidth, 0); n++;
+    Widget xlim_min_label = XtCreateManagedWidget("xlimMinLabel", labelWidgetClass, form_w, args, n);
+
+    /* X-lim min text input */
+    n = 0;
+    XtSetArg(args[n], XtNfromVert, label); n++;
+    XtSetArg(args[n], XtNfromHoriz, xlim_min_label); n++;
+    XtSetArg(args[n], XtNwidth, 120); n++;
+    XtSetArg(args[n], XtNeditType, XawtextEdit); n++;
+    XtSetArg(args[n], XtNstring, xlim_min_str); n++;
+    sbm_settings_text_xlim_min = XtCreateManagedWidget("xlimMinInput", asciiTextWidgetClass, form_w, args, n);
+    XtAddEventHandler(sbm_settings_text_xlim_min, ButtonPressMask, False, sbm_text_click_handler, NULL);
+
+    /* X-lim max label */
+    n = 0;
+    XtSetArg(args[n], XtNfromVert, xlim_min_label); n++;
+    XtSetArg(args[n], XtNlabel, "X-max (um):"); n++;
+    XtSetArg(args[n], XtNborderWidth, 0); n++;
+    Widget xlim_max_label = XtCreateManagedWidget("xlimMaxLabel", labelWidgetClass, form_w, args, n);
+
+    /* X-lim max text input */
+    n = 0;
+    XtSetArg(args[n], XtNfromVert, xlim_min_label); n++;
+    XtSetArg(args[n], XtNfromHoriz, xlim_max_label); n++;
+    XtSetArg(args[n], XtNwidth, 120); n++;
+    XtSetArg(args[n], XtNeditType, XawtextEdit); n++;
+    XtSetArg(args[n], XtNstring, xlim_max_str); n++;
+    sbm_settings_text_xlim_max = XtCreateManagedWidget("xlimMaxInput", asciiTextWidgetClass, form_w, args, n);
+    XtAddEventHandler(sbm_settings_text_xlim_max, ButtonPressMask, False, sbm_text_click_handler, NULL);
+
+    /* Apply button */
+    n = 0;
+    XtSetArg(args[n], XtNfromVert, xlim_max_label); n++;
+    XtSetArg(args[n], XtNlabel, "Apply"); n++;
+    button_w = XtCreateManagedWidget("apply", commandWidgetClass, form_w, args, n);
+    XtAddCallback(button_w, XtNcallback, sbm_settings_apply_callback, NULL);
+
+    /* Close button */
+    n = 0;
+    XtSetArg(args[n], XtNfromVert, xlim_max_label); n++;
+    XtSetArg(args[n], XtNfromHoriz, button_w); n++;
+    XtSetArg(args[n], XtNlabel, "Close"); n++;
+    button_w = XtCreateManagedWidget("close", commandWidgetClass, form_w, args, n);
+    XtAddCallback(button_w, XtNcallback, sbm_settings_close_callback, NULL);
+
+    XtRealizeWidget(sbm_dialog_shell);
+    XtPopup(sbm_dialog_shell, XtGrabNonexclusive);
+
+    /* Set keyboard focus to xlim_min text input */
+    XtSetKeyboardFocus(sbm_dialog_shell, sbm_settings_text_xlim_min);
+    XSync(display, False);
+    Time time_val = CurrentTime;
+    XtCallAcceptFocus(sbm_settings_text_xlim_min, &time_val);
+
+    /* Also set X input focus to the text widget's window */
+    XSetInputFocus(display, XtWindow(sbm_settings_text_xlim_min), RevertToParent, CurrentTime);
+
+    sbm_dialog_active = 1;
+    sbm_active_text_widget = sbm_settings_text_xlim_min;
+    sbm_active_field = 0;
 }
 
 /* SBM timestep switch */
@@ -9409,6 +9764,12 @@ void init_sbm_gui(SBMData *sbm, const char *plotfile_dir, int argc, char **argv)
     XtSetArg(args[n], XtNlabel, "PDF"); n++;
     button = XtCreateManagedWidget("pdf", commandWidgetClass, options_box, args, n);
     XtAddCallback(button, XtNcallback, sbm_pdf_callback, NULL);
+
+    /* Settings button */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "Settings"); n++;
+    button = XtCreateManagedWidget("settings", commandWidgetClass, options_box, args, n);
+    XtAddCallback(button, XtNcallback, sbm_settings_button_callback, NULL);
 
     /* Time navigation row (if multi-timestep) */
     if (n_timesteps > 1) {
