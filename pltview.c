@@ -4345,10 +4345,13 @@ void render_slice(PlotfileData *pf) {
             unsigned long *point_pixels = (unsigned long *)malloc(width * height * sizeof(unsigned long));
             apply_colormap(slice, width, height, point_pixels, display_vmin, display_vmax, pf->colormap);
 
-            /* Compute dot size: scale with zoom so dots fill the space */
-            int dot_size = (int)(3 * zoom_level);
-            if (dot_size < 3) dot_size = 3;
-            int dot_half = dot_size / 2;
+            /* Compute dot size from actual screen-space cell size so dots tile
+             * without gaps regardless of grid resolution or slice axis.
+             * +2 ensures overlap at boundaries. */
+            int dot_w = (int)ceil((double)zoomed_rw / width) + 2;
+            int dot_h = (int)ceil((double)zoomed_rh / height) + 2;
+            if (dot_w < 1) dot_w = 1;
+            if (dot_h < 1) dot_h = 1;
 
             /* Render each data point at its coordinate */
             for (j = 0; j < height; j++) {
@@ -4362,9 +4365,9 @@ void render_slice(PlotfileData *pf) {
                         int screen_x = zoom_base_x + (int)((x_coord - phys_xmin) / (phys_xmax - phys_xmin) * zoomed_rw);
                         int screen_y = zoom_base_y + (int)((phys_ymax - y_coord) / (phys_ymax - phys_ymin) * zoomed_rh);
 
-                        /* Draw a rectangle for each data point, scaled with zoom */
+                        /* Draw a rectangle for each data point */
                         XSetForeground(display, gc, point_pixels[idx]);
-                        XFillRectangle(display, canvas, gc, screen_x - dot_half, screen_y - dot_half, dot_size, dot_size);
+                        XFillRectangle(display, canvas, gc, screen_x, screen_y, dot_w, dot_h);
                     }
                 }
             }
@@ -5073,9 +5076,20 @@ void render_slice(PlotfileData *pf) {
     char x_label[32], y_label[32];
 
     if (pf->map_mode) {
-        /* Map mode: use longitude/latitude labels */
-        strcpy(x_label, "Longitude (deg)");
-        strcpy(y_label, "Latitude (deg)");
+        /* Map mode: axis labels depend on slice axis */
+        if (pf->slice_axis == 2) {
+            /* Z-slice: lon on X, lat on Y */
+            strcpy(x_label, "Longitude (deg)");
+            strcpy(y_label, "Latitude (deg)");
+        } else if (pf->slice_axis == 1) {
+            /* Y-slice: lon on X, height on Y */
+            strcpy(x_label, "Longitude (deg)");
+            strcpy(y_label, "Height (m)");
+        } else {
+            /* X-slice: lat on X, height on Y */
+            strcpy(x_label, "Latitude (deg)");
+            strcpy(y_label, "Height (m)");
+        }
     } else {
         /* Normal mode: use physical coordinates with units */
         const char *unit_str = "(m)";
@@ -5119,8 +5133,8 @@ void render_slice(PlotfileData *pf) {
         render_quiver_overlay(pf);
     }
 
-    /* Draw map overlay if in map mode */
-    if (pf->map_mode) {
+    /* Draw map overlay (coastlines etc.) only for Z-slice in map mode */
+    if (pf->map_mode && pf->slice_axis == 2) {
         render_map_overlay(pf, phys_xmin, phys_xmax, phys_ymin, phys_ymax);
     }
 
@@ -5484,8 +5498,8 @@ void draw_horizontal_plot(Display *dpy, Window win, GC plot_gc, double *data, do
         /* Draw tick mark */
         XDrawLine(dpy, win, plot_gc, plot_left - 3, y_pos, plot_left, y_pos);
 
-        /* Draw label */
-        snprintf(label, sizeof(label), "%.0f", y_val);
+        /* Draw label — %.6g avoids scientific notation for values up to ~999999 */
+        snprintf(label, sizeof(label), "%.6g", y_val);
         int label_width = XTextWidth(font, label, strlen(label));
         XDrawString(dpy, win, plot_gc, plot_left - label_width - 5, y_pos + 4, label, strlen(label));
     }
@@ -5572,131 +5586,166 @@ void plot_expose_handler(Widget w, XtPointer client_data, XEvent *event, Boolean
     XFreeGC(display, plot_gc);
 }
 
-/* Callback to destroy popup and free data */
-void close_popup_callback(Widget w, XtPointer client_data, XtPointer call_data) {
-    PopupData *popup_data = (PopupData *)client_data;
-    
-    if (popup_data) {
-        /* Free plot data */
+/* Line-profile popup data (3 standard line plots: X, Y, Z profiles) */
+typedef struct {
+    Widget shell;
+    Widget canvases[3];     /* x_canvas, y_canvas, z_canvas */
+    PlotData *plots[3];     /* x_plot, y_plot, z_plot */
+    double *phys_values[3]; /* physical coordinate arrays (m) per axis */
+    double *layer_values[3];/* 0-indexed layer arrays per axis */
+    double phys_min[3], phys_max[3];
+    double layer_min[3], layer_max[3];
+    int show_layer;         /* 0 = physical (default), 1 = layer index */
+    char phys_labels[3][32];
+    char layer_labels[3][32];
+} LineProfilePopupData;
+
+/* Close callback for line-profile popup */
+void close_line_profile_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    LineProfilePopupData *pd = (LineProfilePopupData *)client_data;
+    if (pd) {
         for (int i = 0; i < 3; i++) {
-            if (popup_data->plot_data_array[i]) {
-                if (popup_data->plot_data_array[i]->data) 
-                    free(popup_data->plot_data_array[i]->data);
-                if (popup_data->plot_data_array[i]->x_values)
-                    free(popup_data->plot_data_array[i]->x_values);
-                free(popup_data->plot_data_array[i]);
+            if (pd->plots[i]) {
+                if (pd->plots[i]->data) free(pd->plots[i]->data);
+                /* x_values is owned by phys_values/layer_values, not the plot */
+                free(pd->plots[i]);
             }
+            if (pd->phys_values[i])  free(pd->phys_values[i]);
+            if (pd->layer_values[i]) free(pd->layer_values[i]);
         }
-        
-        /* Destroy the popup shell */
-        XtDestroyWidget(popup_data->shell);
-        
-        /* Free the popup data structure */
-        free(popup_data);
+        XtDestroyWidget(pd->shell);
+        free(pd);
     }
+}
+
+/* Toggle physical/layer axis on all three line-profile plots */
+void toggle_line_layer_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    LineProfilePopupData *pd = (LineProfilePopupData *)client_data;
+    pd->show_layer = !pd->show_layer;
+
+    for (int i = 0; i < 3; i++) {
+        pd->plots[i]->x_values = pd->show_layer ? pd->layer_values[i] : pd->phys_values[i];
+        pd->plots[i]->xmin     = pd->show_layer ? pd->layer_min[i]    : pd->phys_min[i];
+        pd->plots[i]->xmax     = pd->show_layer ? pd->layer_max[i]    : pd->phys_max[i];
+        snprintf(pd->plots[i]->xlabel, sizeof(pd->plots[i]->xlabel), "%s",
+                 pd->show_layer ? pd->layer_labels[i] : pd->phys_labels[i]);
+        if (XtWindow(pd->canvases[i]))
+            XClearArea(XtDisplay(pd->canvases[i]), XtWindow(pd->canvases[i]), 0, 0, 0, 0, True);
+    }
+    XtVaSetValues(w, XtNlabel, pd->show_layer ? "m" : "Layer", NULL);
 }
 
 /* Show 1D line profiles through clicked point along x, y, z */
 void show_line_profiles(PlotfileData *pf, int data_x, int data_y) {
     /* Get 3D coordinates based on current slice */
     int x_coord, y_coord, z_coord;
-    
-    if (pf->slice_axis == 2) {  /* Z slice */
-        x_coord = data_x;
-        y_coord = data_y;
-        z_coord = pf->slice_idx;
-    } else if (pf->slice_axis == 1) {  /* Y slice */
-        x_coord = data_x;
-        y_coord = pf->slice_idx;
-        z_coord = data_y;
-    } else {  /* X slice */
-        x_coord = pf->slice_idx;
-        y_coord = data_x;
-        z_coord = data_y;
+
+    if (pf->slice_axis == 2) {
+        x_coord = data_x; y_coord = data_y; z_coord = pf->slice_idx;
+    } else if (pf->slice_axis == 1) {
+        x_coord = data_x; y_coord = pf->slice_idx; z_coord = data_y;
+    } else {
+        x_coord = pf->slice_idx; y_coord = data_x; z_coord = data_y;
     }
-    
-    /* Create plot data structures */
+
+    /* Compute physical coordinate arrays for all three axes */
+    int dims[3] = { pf->grid_dims[0], pf->grid_dims[1], pf->grid_dims[2] };
+    double *phys[3], *layer[3];
+    for (int a = 0; a < 3; a++) {
+        phys[a]  = (double *)malloc(dims[a] * sizeof(double));
+        layer[a] = (double *)malloc(dims[a] * sizeof(double));
+        double dphys = (pf->prob_hi[a] - pf->prob_lo[a]) / dims[a];
+        for (int n = 0; n < dims[a]; n++) {
+            phys[a][n]  = pf->prob_lo[a] + (n + 0.5) * dphys;
+            layer[a][n] = n;
+        }
+    }
+
+    /* Create plot data — default x axis = physical (m) */
     PlotData *x_plot_data = (PlotData *)malloc(sizeof(PlotData));
-    PlotData *y_plot_data = (PlotData *)malloc(sizeof(PlotData));
-    PlotData *z_plot_data = (PlotData *)malloc(sizeof(PlotData));
-    
-    /* Extract and store X profile data */
-    x_plot_data->n_points = pf->grid_dims[0];
-    x_plot_data->data = (double *)malloc(pf->grid_dims[0] * sizeof(double));
-    x_plot_data->x_values = (double *)malloc(pf->grid_dims[0] * sizeof(double));
-    x_plot_data->vmin = 1e30;
-    x_plot_data->vmax = -1e30;
-    for (int i = 0; i < pf->grid_dims[0]; i++) {
-        x_plot_data->x_values[i] = i;
-        int idx = z_coord * pf->grid_dims[0] * pf->grid_dims[1] + y_coord * pf->grid_dims[0] + i;
+    x_plot_data->n_points = dims[0];
+    x_plot_data->data     = (double *)malloc(dims[0] * sizeof(double));
+    x_plot_data->x_values = phys[0];
+    x_plot_data->vmin = 1e30; x_plot_data->vmax = -1e30;
+    for (int i = 0; i < dims[0]; i++) {
+        int idx = z_coord * dims[0] * dims[1] + y_coord * dims[0] + i;
         x_plot_data->data[i] = pf->data[idx];
         if (x_plot_data->data[i] < x_plot_data->vmin) x_plot_data->vmin = x_plot_data->data[i];
         if (x_plot_data->data[i] > x_plot_data->vmax) x_plot_data->vmax = x_plot_data->data[i];
     }
-    x_plot_data->xmin = 0;
-    x_plot_data->xmax = pf->grid_dims[0] - 1;
-    snprintf(x_plot_data->title, sizeof(x_plot_data->title), "%s along X (Y=%d, Z=%d)", 
+    x_plot_data->xmin = phys[0][0];
+    x_plot_data->xmax = phys[0][dims[0]-1];
+    snprintf(x_plot_data->title, sizeof(x_plot_data->title), "%s along X (Y=%d, Z=%d)",
              pf->variables[pf->current_var], y_coord, z_coord);
-    snprintf(x_plot_data->xlabel, sizeof(x_plot_data->xlabel), "X");
-    
-    /* Extract and store Y profile data */
-    y_plot_data->n_points = pf->grid_dims[1];
-    y_plot_data->data = (double *)malloc(pf->grid_dims[1] * sizeof(double));
-    y_plot_data->x_values = (double *)malloc(pf->grid_dims[1] * sizeof(double));
-    y_plot_data->vmin = 1e30;
-    y_plot_data->vmax = -1e30;
-    for (int j = 0; j < pf->grid_dims[1]; j++) {
-        y_plot_data->x_values[j] = j;
-        int idx = z_coord * pf->grid_dims[0] * pf->grid_dims[1] + j * pf->grid_dims[0] + x_coord;
+    snprintf(x_plot_data->xlabel, sizeof(x_plot_data->xlabel), "X (m)");
+
+    PlotData *y_plot_data = (PlotData *)malloc(sizeof(PlotData));
+    y_plot_data->n_points = dims[1];
+    y_plot_data->data     = (double *)malloc(dims[1] * sizeof(double));
+    y_plot_data->x_values = phys[1];
+    y_plot_data->vmin = 1e30; y_plot_data->vmax = -1e30;
+    for (int j = 0; j < dims[1]; j++) {
+        int idx = z_coord * dims[0] * dims[1] + j * dims[0] + x_coord;
         y_plot_data->data[j] = pf->data[idx];
         if (y_plot_data->data[j] < y_plot_data->vmin) y_plot_data->vmin = y_plot_data->data[j];
         if (y_plot_data->data[j] > y_plot_data->vmax) y_plot_data->vmax = y_plot_data->data[j];
     }
-    y_plot_data->xmin = 0;
-    y_plot_data->xmax = pf->grid_dims[1] - 1;
-    snprintf(y_plot_data->title, sizeof(y_plot_data->title), "%s along Y (X=%d, Z=%d)", 
+    y_plot_data->xmin = phys[1][0];
+    y_plot_data->xmax = phys[1][dims[1]-1];
+    snprintf(y_plot_data->title, sizeof(y_plot_data->title), "%s along Y (X=%d, Z=%d)",
              pf->variables[pf->current_var], x_coord, z_coord);
-    snprintf(y_plot_data->xlabel, sizeof(y_plot_data->xlabel), "Y");
-    
-    /* Extract and store Z profile data */
-    z_plot_data->n_points = pf->grid_dims[2];
-    z_plot_data->data = (double *)malloc(pf->grid_dims[2] * sizeof(double));
-    z_plot_data->x_values = (double *)malloc(pf->grid_dims[2] * sizeof(double));
-    z_plot_data->vmin = 1e30;
-    z_plot_data->vmax = -1e30;
-    for (int k = 0; k < pf->grid_dims[2]; k++) {
-        z_plot_data->x_values[k] = k;
-        int idx = k * pf->grid_dims[0] * pf->grid_dims[1] + y_coord * pf->grid_dims[0] + x_coord;
+    snprintf(y_plot_data->xlabel, sizeof(y_plot_data->xlabel), "Y (m)");
+
+    PlotData *z_plot_data = (PlotData *)malloc(sizeof(PlotData));
+    z_plot_data->n_points = dims[2];
+    z_plot_data->data     = (double *)malloc(dims[2] * sizeof(double));
+    z_plot_data->x_values = phys[2];
+    z_plot_data->vmin = 1e30; z_plot_data->vmax = -1e30;
+    for (int k = 0; k < dims[2]; k++) {
+        int idx = k * dims[0] * dims[1] + y_coord * dims[0] + x_coord;
         z_plot_data->data[k] = pf->data[idx];
         if (z_plot_data->data[k] < z_plot_data->vmin) z_plot_data->vmin = z_plot_data->data[k];
         if (z_plot_data->data[k] > z_plot_data->vmax) z_plot_data->vmax = z_plot_data->data[k];
     }
-    z_plot_data->xmin = 0;
-    z_plot_data->xmax = pf->grid_dims[2] - 1;
-    snprintf(z_plot_data->title, sizeof(z_plot_data->title), "%s along Z (X=%d, Y=%d)", 
+    z_plot_data->xmin = phys[2][0];
+    z_plot_data->xmax = phys[2][dims[2]-1];
+    snprintf(z_plot_data->title, sizeof(z_plot_data->title), "%s along Z (X=%d, Y=%d)",
              pf->variables[pf->current_var], x_coord, y_coord);
-    snprintf(z_plot_data->xlabel, sizeof(z_plot_data->xlabel), "Z");
-    
-    /* Create popup data structure */
-    PopupData *popup_data = (PopupData *)malloc(sizeof(PopupData));
-    popup_data->plot_data_array[0] = x_plot_data;
-    popup_data->plot_data_array[1] = y_plot_data;
-    popup_data->plot_data_array[2] = z_plot_data;
-    
+    snprintf(z_plot_data->xlabel, sizeof(z_plot_data->xlabel), "Height (m)");
+
+    /* Build LineProfilePopupData */
+    LineProfilePopupData *pd = (LineProfilePopupData *)malloc(sizeof(LineProfilePopupData));
+    pd->plots[0] = x_plot_data;
+    pd->plots[1] = y_plot_data;
+    pd->plots[2] = z_plot_data;
+    for (int a = 0; a < 3; a++) {
+        pd->phys_values[a]  = phys[a];
+        pd->layer_values[a] = layer[a];
+        pd->phys_min[a]     = phys[a][0];
+        pd->phys_max[a]     = phys[a][dims[a]-1];
+        pd->layer_min[a]    = 0;
+        pd->layer_max[a]    = dims[a] - 1;
+    }
+    pd->show_layer = 0;
+    snprintf(pd->phys_labels[0], sizeof(pd->phys_labels[0]), "X (m)");
+    snprintf(pd->phys_labels[1], sizeof(pd->phys_labels[1]), "Y (m)");
+    snprintf(pd->phys_labels[2], sizeof(pd->phys_labels[2]), "Height (m)");
+    snprintf(pd->layer_labels[0], sizeof(pd->layer_labels[0]), "X Layer");
+    snprintf(pd->layer_labels[1], sizeof(pd->layer_labels[1]), "Y Layer");
+    snprintf(pd->layer_labels[2], sizeof(pd->layer_labels[2]), "Z Layer");
+
     /* Create popup shell */
     Widget popup_shell = XtVaCreatePopupShell("Line Profiles",
         transientShellWidgetClass, toplevel,
         XtNwidth, 900,
         XtNheight, 700,
         NULL);
-    
-    /* Store shell in popup data */
-    popup_data->shell = popup_shell;
-    
+    pd->shell = popup_shell;
+
     Widget popup_form = XtVaCreateManagedWidget("form",
         formWidgetClass, popup_shell,
         NULL);
-    
+
     /* Title label */
     char title_text[256];
     snprintf(title_text, sizeof(title_text),
@@ -5707,55 +5756,63 @@ void show_line_profiles(PlotfileData *pf, int data_x, int data_y) {
         XtNlabel, title_text,
         XtNwidth, 880,
         NULL);
-    
-    /* Create three plot canvases with expose event handlers */
+
     Widget x_canvas = XtVaCreateManagedWidget("x_plot",
         simpleWidgetClass, popup_form,
         XtNfromVert, title_label,
-        XtNwidth, 880,
-        XtNheight, 180,
-        XtNborderWidth, 1,
+        XtNwidth, 880, XtNheight, 180, XtNborderWidth, 1,
         NULL);
-    
     Widget y_canvas = XtVaCreateManagedWidget("y_plot",
         simpleWidgetClass, popup_form,
         XtNfromVert, x_canvas,
-        XtNwidth, 880,
-        XtNheight, 180,
-        XtNborderWidth, 1,
+        XtNwidth, 880, XtNheight, 180, XtNborderWidth, 1,
         NULL);
-    
     Widget z_canvas = XtVaCreateManagedWidget("z_plot",
         simpleWidgetClass, popup_form,
         XtNfromVert, y_canvas,
-        XtNwidth, 880,
-        XtNheight, 180,
-        XtNborderWidth, 1,
+        XtNwidth, 880, XtNheight, 180, XtNborderWidth, 1,
         NULL);
-    
-    /* Add expose event handlers to all three canvases */
+
+    pd->canvases[0] = x_canvas;
+    pd->canvases[1] = y_canvas;
+    pd->canvases[2] = z_canvas;
+
     XtAddEventHandler(x_canvas, ExposureMask, False, plot_expose_handler, x_plot_data);
     XtAddEventHandler(y_canvas, ExposureMask, False, plot_expose_handler, y_plot_data);
     XtAddEventHandler(z_canvas, ExposureMask, False, plot_expose_handler, z_plot_data);
-    
-    /* Close button */
+
     Widget close_button = XtVaCreateManagedWidget("Close",
         commandWidgetClass, popup_form,
         XtNfromVert, z_canvas,
         NULL);
-    
-    XtAddCallback(close_button, XtNcallback, close_popup_callback, popup_data);
-    
-    /* Show popup */
+    XtAddCallback(close_button, XtNcallback, close_line_profile_callback, pd);
+
+    /* Layer toggle button next to Close */
+    Widget layer_button = XtVaCreateManagedWidget("layer_btn",
+        commandWidgetClass, popup_form,
+        XtNlabel, "Layer",
+        XtNfromVert, z_canvas,
+        XtNfromHoriz, close_button,
+        NULL);
+    XtAddCallback(layer_button, XtNcallback, toggle_line_layer_callback, pd);
+
     XtPopup(popup_shell, XtGrabNone);
 }
 
 /* Popup data for profile (3 plots) */
 typedef struct {
     Widget shell;
+    Widget mean_canvas, std_canvas, skewness_canvas;
     PlotData *mean_plot;
     PlotData *std_plot;
     PlotData *skewness_plot;
+    double *phys_values;    /* physical coordinate values (e.g., height in m) */
+    double *layer_values;   /* 1-indexed layer numbers */
+    double phys_min, phys_max;
+    double layer_min, layer_max;
+    int show_layer;         /* 0 = physical coords (default), 1 = layer index */
+    char phys_label[32];    /* axis label for physical mode */
+    char layer_label[32];   /* axis label for layer-index mode, e.g. "Z Layer" */
 } ProfilePopupData;
 
 /* Callback to destroy profile popup and free data */
@@ -5765,22 +5822,61 @@ void close_profile_popup_callback(Widget w, XtPointer client_data, XtPointer cal
     if (popup_data) {
         if (popup_data->mean_plot) {
             if (popup_data->mean_plot->data) free(popup_data->mean_plot->data);
-            if (popup_data->mean_plot->x_values) free(popup_data->mean_plot->x_values);
+            /* x_values is owned by popup_data, not individual plots */
             free(popup_data->mean_plot);
         }
         if (popup_data->std_plot) {
             if (popup_data->std_plot->data) free(popup_data->std_plot->data);
-            /* Note: std_plot->x_values is shared with mean_plot, already freed */
             free(popup_data->std_plot);
         }
         if (popup_data->skewness_plot) {
             if (popup_data->skewness_plot->data) free(popup_data->skewness_plot->data);
-            /* Note: skewness_plot->x_values is shared with mean_plot, already freed */
             free(popup_data->skewness_plot);
         }
+        if (popup_data->phys_values) free(popup_data->phys_values);
+        if (popup_data->layer_values) free(popup_data->layer_values);
         XtDestroyWidget(popup_data->shell);
         free(popup_data);
     }
+}
+
+/* Toggle between physical-coordinate and layer-index display in profile popup */
+void toggle_zlayer_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    ProfilePopupData *popup_data = (ProfilePopupData *)client_data;
+    popup_data->show_layer = !popup_data->show_layer;
+
+    double *new_x    = popup_data->show_layer ? popup_data->layer_values : popup_data->phys_values;
+    double  new_xmin = popup_data->show_layer ? popup_data->layer_min    : popup_data->phys_min;
+    double  new_xmax = popup_data->show_layer ? popup_data->layer_max    : popup_data->phys_max;
+    const char *new_label = popup_data->show_layer ? popup_data->layer_label : popup_data->phys_label;
+
+    /* Update x axis in all three plots */
+    popup_data->mean_plot->x_values = new_x;
+    popup_data->mean_plot->xmin = new_xmin;
+    popup_data->mean_plot->xmax = new_xmax;
+    snprintf(popup_data->mean_plot->xlabel, sizeof(popup_data->mean_plot->xlabel), "%s", new_label);
+
+    popup_data->std_plot->x_values = new_x;
+    popup_data->std_plot->xmin = new_xmin;
+    popup_data->std_plot->xmax = new_xmax;
+    snprintf(popup_data->std_plot->xlabel, sizeof(popup_data->std_plot->xlabel), "%s", new_label);
+
+    popup_data->skewness_plot->x_values = new_x;
+    popup_data->skewness_plot->xmin = new_xmin;
+    popup_data->skewness_plot->xmax = new_xmax;
+    snprintf(popup_data->skewness_plot->xlabel, sizeof(popup_data->skewness_plot->xlabel), "%s", new_label);
+
+    /* Update button label to show what clicking it will switch to */
+    XtVaSetValues(w, XtNlabel, popup_data->show_layer ? popup_data->phys_label : popup_data->layer_label, NULL);
+
+    /* Force redraw of all three canvases */
+    Display *dpy = XtDisplay(popup_data->mean_canvas);
+    if (XtWindow(popup_data->mean_canvas))
+        XClearArea(dpy, XtWindow(popup_data->mean_canvas), 0, 0, 0, 0, True);
+    if (XtWindow(popup_data->std_canvas))
+        XClearArea(dpy, XtWindow(popup_data->std_canvas), 0, 0, 0, 0, True);
+    if (XtWindow(popup_data->skewness_canvas))
+        XClearArea(dpy, XtWindow(popup_data->skewness_canvas), 0, 0, 0, 0, True);
 }
 
 /* Show slice statistics (mean and std) along current axis */
@@ -5808,6 +5904,14 @@ void show_slice_statistics(PlotfileData *pf) {
     double *stds = (double *)malloc(n_slices * sizeof(double));
     double *skewness = (double *)malloc(n_slices * sizeof(double));
     double *layer_indices = (double *)malloc(n_slices * sizeof(double));
+
+    /* Physical coordinate values (e.g., height in m for Z axis) */
+    double *phys_values = (double *)malloc(n_slices * sizeof(double));
+    double dphys = (pf->prob_hi[axis] - pf->prob_lo[axis]) / n_slices;
+    for (int s = 0; s < n_slices; s++)
+        phys_values[s] = pf->prob_lo[axis] + (s + 0.5) * dphys;
+    double phys_min = phys_values[0];
+    double phys_max = phys_values[n_slices - 1];
 
     /* Calculate mean, std, and skewness for each slice */
     for (int s = 0; s < n_slices; s++) {
@@ -5864,59 +5968,64 @@ void show_slice_statistics(PlotfileData *pf) {
         }
     }
 
-    /* Create plot data for mean */
+    /* Determine physical axis label: "Height (m)" for Z, otherwise axis name with units */
+    const char *axis_labels[] = {"X (m)", "Y (m)", "Height (m)"};
+    const char *layer_labels[] = {"X Layer", "Y Layer", "Z Layer"};
+    const char *phys_label = axis_labels[axis];
+    const char *layer_label = layer_labels[axis];
+
+    /* Create plot data for mean - default x axis = physical coordinates */
     PlotData *mean_plot = (PlotData *)malloc(sizeof(PlotData));
     mean_plot->n_points = n_slices;
     mean_plot->data = means;
-    mean_plot->x_values = (double *)malloc(n_slices * sizeof(double));
-    memcpy(mean_plot->x_values, layer_indices, n_slices * sizeof(double));
+    mean_plot->x_values = phys_values;
     mean_plot->vmin = 1e30;
     mean_plot->vmax = -1e30;
     for (int i = 0; i < n_slices; i++) {
         if (means[i] < mean_plot->vmin) mean_plot->vmin = means[i];
         if (means[i] > mean_plot->vmax) mean_plot->vmax = means[i];
     }
-    mean_plot->xmin = 1;
-    mean_plot->xmax = n_slices;
+    mean_plot->xmin = phys_min;
+    mean_plot->xmax = phys_max;
     snprintf(mean_plot->title, sizeof(mean_plot->title), "%s Mean along %s axis",
              pf->variables[pf->current_var], axis_names[axis]);
-    snprintf(mean_plot->xlabel, sizeof(mean_plot->xlabel), "%s Layer", axis_names[axis]);
+    snprintf(mean_plot->xlabel, sizeof(mean_plot->xlabel), "%s", phys_label);
     snprintf(mean_plot->vlabel, sizeof(mean_plot->vlabel), "%s Mean", pf->variables[pf->current_var]);
 
     /* Create plot data for std */
     PlotData *std_plot = (PlotData *)malloc(sizeof(PlotData));
     std_plot->n_points = n_slices;
     std_plot->data = stds;
-    std_plot->x_values = layer_indices;  /* Share with mean, will be freed once */
+    std_plot->x_values = phys_values;
     std_plot->vmin = 1e30;
     std_plot->vmax = -1e30;
     for (int i = 0; i < n_slices; i++) {
         if (stds[i] < std_plot->vmin) std_plot->vmin = stds[i];
         if (stds[i] > std_plot->vmax) std_plot->vmax = stds[i];
     }
-    std_plot->xmin = 1;
-    std_plot->xmax = n_slices;
+    std_plot->xmin = phys_min;
+    std_plot->xmax = phys_max;
     snprintf(std_plot->title, sizeof(std_plot->title), "%s Std Dev along %s axis",
              pf->variables[pf->current_var], axis_names[axis]);
-    snprintf(std_plot->xlabel, sizeof(std_plot->xlabel), "%s Layer", axis_names[axis]);
+    snprintf(std_plot->xlabel, sizeof(std_plot->xlabel), "%s", phys_label);
     snprintf(std_plot->vlabel, sizeof(std_plot->vlabel), "%s Std", pf->variables[pf->current_var]);
 
     /* Create plot data for skewness */
     PlotData *skewness_plot = (PlotData *)malloc(sizeof(PlotData));
     skewness_plot->n_points = n_slices;
     skewness_plot->data = skewness;
-    skewness_plot->x_values = layer_indices;  /* Share with mean, will be freed once */
+    skewness_plot->x_values = phys_values;
     skewness_plot->vmin = 1e30;
     skewness_plot->vmax = -1e30;
     for (int i = 0; i < n_slices; i++) {
         if (skewness[i] < skewness_plot->vmin) skewness_plot->vmin = skewness[i];
         if (skewness[i] > skewness_plot->vmax) skewness_plot->vmax = skewness[i];
     }
-    skewness_plot->xmin = 1;
-    skewness_plot->xmax = n_slices;
+    skewness_plot->xmin = phys_min;
+    skewness_plot->xmax = phys_max;
     snprintf(skewness_plot->title, sizeof(skewness_plot->title), "%s Skewness along %s axis",
              pf->variables[pf->current_var], axis_names[axis]);
-    snprintf(skewness_plot->xlabel, sizeof(skewness_plot->xlabel), "%s Layer", axis_names[axis]);
+    snprintf(skewness_plot->xlabel, sizeof(skewness_plot->xlabel), "%s", phys_label);
     snprintf(skewness_plot->vlabel, sizeof(skewness_plot->vlabel), "%s Skewness", pf->variables[pf->current_var]);
 
     /* Create popup data structure */
@@ -5924,6 +6033,15 @@ void show_slice_statistics(PlotfileData *pf) {
     popup_data->mean_plot = mean_plot;
     popup_data->std_plot = std_plot;
     popup_data->skewness_plot = skewness_plot;
+    popup_data->phys_values = phys_values;
+    popup_data->layer_values = layer_indices;
+    popup_data->phys_min = phys_min;
+    popup_data->phys_max = phys_max;
+    popup_data->layer_min = 1;
+    popup_data->layer_max = n_slices;
+    popup_data->show_layer = 0;
+    snprintf(popup_data->phys_label, sizeof(popup_data->phys_label), "%s", phys_label);
+    snprintf(popup_data->layer_label, sizeof(popup_data->layer_label), "%s", layer_label);
 
     /* Create popup shell - wider for 3 side-by-side plots */
     Widget popup_shell = XtVaCreatePopupShell("Slice Statistics",
@@ -5964,6 +6082,11 @@ void show_slice_statistics(PlotfileData *pf) {
         XtNborderWidth, 1,
         NULL);
 
+    /* Store canvas widgets in popup_data for toggle redraws */
+    popup_data->mean_canvas = mean_canvas;
+    popup_data->std_canvas = std_canvas;
+    popup_data->skewness_canvas = skewness_canvas;
+
     /* Add expose event handlers - using horizontal plot (layer on Y, value on X) */
     XtAddEventHandler(mean_canvas, ExposureMask, False, horizontal_plot_expose_handler, mean_plot);
     XtAddEventHandler(std_canvas, ExposureMask, False, horizontal_plot_expose_handler, std_plot);
@@ -5976,6 +6099,16 @@ void show_slice_statistics(PlotfileData *pf) {
         NULL);
 
     XtAddCallback(close_button, XtNcallback, close_profile_popup_callback, popup_data);
+
+    /* Layer toggle button - next to Close; label is axis-dependent */
+    Widget zlayer_button = XtVaCreateManagedWidget("layer_btn",
+        commandWidgetClass, popup_form,
+        XtNlabel, layer_label,
+        XtNfromVert, mean_canvas,
+        XtNfromHoriz, close_button,
+        NULL);
+
+    XtAddCallback(zlayer_button, XtNcallback, toggle_zlayer_callback, popup_data);
 
     /* Show popup */
     XtPopup(popup_shell, XtGrabNone);

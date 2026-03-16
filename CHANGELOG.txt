@@ -1,6 +1,16 @@
 Changelog
 =========
 
+v0.5.7
+------
+- Profile popup: Show height in meters (m) by default on Y axis; add "Z Layer" toggle button to switch to layer index
+- Profile popup: Button label is axis-aware ("X Layer", "Y Layer", "Z Layer") when viewing X/Y/Z slices
+- Profile popup: Y-axis tick labels use non-scientific notation (%.6g)
+- Line profile popup (click-to-profile): X/Y/Z axes now default to physical coordinates (m); add "Layer" toggle button
+- Map mode X/Y slices: Fix discontinuous color bands by computing dot size from actual screen-space cell size
+- Map mode X/Y slices: Remove coastline overlay (map lines only shown for Z-slice)
+- Map mode X/Y slices: Fix axis labels — Y-axis now shows "Height (m)"; X-axis shows "Longitude (deg)" for Y-slice and "Latitude (deg)" for X-slice
+
 v0.5.6
 ------
 - FFT popup: Add method toggle between 2D FFT and Wiener-Khinchin (Ma et al. 2024)
