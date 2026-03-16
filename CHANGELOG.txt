@@ -1,6 +1,10 @@
 Changelog
 =========
 
+v0.5.8
+------
+- Map mode: Preserve map mode state when switching timesteps (no longer resets to off)
+
 v0.5.7
 ------
 - Profile popup: Show height in meters (m) by default on Y axis; add "Z Layer" toggle button to switch to layer index

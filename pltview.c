@@ -949,14 +949,18 @@ void switch_timestep(PlotfileData *pf, int new_timestep) {
     /* Always free old overlay data before reading new timestep */
     free_all_levels(pf);
 
-    /* Save overlay_mode before read_header (which resets it) */
+    /* Save overlay_mode and map_mode before read_header (which resets them) */
     int saved_overlay_mode = pf->overlay_mode;
+    int saved_map_mode = pf->map_mode;
 
     /* Re-read header for new timestep */
     read_header(pf);
 
-    /* Restore overlay_mode */
+    /* Restore overlay_mode and map_mode */
     pf->overlay_mode = saved_overlay_mode;
+    pf->map_mode = saved_map_mode;
+    if (map_button_widget)
+        XtVaSetValues(map_button_widget, XtNlabel, pf->map_mode ? "Map: ON" : "Map: OFF", NULL);
 
     /* Clamp current_level if new timestep has fewer levels */
     if (pf->current_level >= pf->n_levels) {
