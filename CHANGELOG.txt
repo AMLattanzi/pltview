@@ -1,6 +1,19 @@
 Changelog
 =========
 
+v0.5.9
+------
+- Add --profile mode: 1D profile viewer for ERF data_log output files (surf, mean, flux, subgrid)
+  - Scrollable vertical variable selector panel
+  - Profile view: Z vs. variable at a selected timestep, with </> or arrow-key navigation
+  - Time-height contour view: viridis-colored 2D image (X=time, Y=z) with colorbar; toggle with Contour button
+  - LogX toggle for profile view
+  - Flexible file matching: tries exact names first, then scans for filenames containing the keyword (e.g. abl_surf, erf_mean); shows X11 error dialog if no files found
+- Profile popup (normal plotfile mode): add "Time-Profile Contour" button
+  - Computes horizontal (XY) mean per z-level across all loaded timesteps
+  - Renders time-height contour with viridis colormap and labeled colorbar
+  - Only shown when multiple timesteps are loaded
+
 v0.5.8
 ------
 - Map mode: Preserve map mode state when switching timesteps (no longer resets to off)

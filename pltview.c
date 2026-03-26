@@ -174,6 +174,35 @@ typedef struct {
     char plotfile_dir[MAX_PATH];
 } SBMData;
 
+/* 1D Profile mode definitions */
+#define PROFILE_FILE_SURF    0
+#define PROFILE_FILE_MEAN    1
+#define PROFILE_FILE_FLUX    2
+#define PROFILE_FILE_SUBGRID 3
+#define N_PROFILE_FILES      4
+#define MAX_PROFILE_ROWS     500000
+#define MAX_PROFILE_COLS     32
+
+typedef struct {
+    char filename[256];   /* basename of the file (surf/mean/flux/subgrid) */
+    int has_z;            /* 0 for surf (time-series), 1 for mean/flux/subgrid */
+    int ncols;            /* total number of data columns */
+    char col_names[MAX_PROFILE_COLS][32];
+    double *data;         /* [nrows * ncols] row-major */
+    int nrows;
+    /* For has_z=1: indexed by timestep */
+    double *times;        /* unique sorted time values [ntimes] */
+    int ntimes;
+    int nz;               /* z levels per timestep */
+    double z_min, z_max;
+} ProfileFile;
+
+typedef struct {
+    char dir[MAX_PATH];
+    ProfileFile files[N_PROFILE_FILES];
+    int loaded[N_PROFILE_FILES];   /* 1 if file exists and was read */
+} ProfileData;
+
 /* X11 globals */
 Display *display;
 Widget toplevel, form, canvas_widget, var_box, info_label;
@@ -276,6 +305,23 @@ int sbm_dialog_active = 0;
 Widget sbm_active_text_widget = NULL;
 int sbm_active_field = 0;  /* 0=xlim_min, 1=xlim_max */
 Widget sbm_dialog_shell = NULL;
+/* 1D Profile mode globals */
+int profile_mode = 0;
+ProfileData *global_profile = NULL;
+Widget profile_canvas_widget = NULL;
+Window profile_canvas = 0;
+Widget profile_info_label = NULL;
+int profile_current_file = PROFILE_FILE_MEAN;   /* which file to show */
+int profile_current_col = 2;                     /* which column (0=time,1=z,2=first data) */
+int profile_current_time_idx = 0;
+int profile_log_x = 0;
+Widget profile_file_buttons[N_PROFILE_FILES];
+Widget *profile_var_buttons = NULL;
+int profile_n_var_buttons = 0;
+Widget profile_var_box_widget = NULL;   /* viewport's inner box for var buttons */
+Widget profile_var_viewport = NULL;     /* scrollable viewport for var buttons */
+int profile_contour_mode = 0;           /* 0=profile line, 1=time-height contour */
+
 Widget map_dialog_shell = NULL;
 Widget map_unavailable_shell = NULL;
 Widget map_unavailable_label = NULL;
@@ -398,6 +444,9 @@ void update_time_label(void);
 void time_jump_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void time_series_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void show_time_series(PlotfileData *pf);
+void show_time_height_contour(PlotfileData *pf);
+void profile_fmt_val(char *buf, int bufsz, double v);
+static void time_height_contour_callback(Widget w, XtPointer client_data, XtPointer call_data);
 
 /* SDM functions */
 int read_sdm_header(ParticleData *pd, const char *plotfile_dir);
@@ -440,6 +489,25 @@ void sbm_canvas_expose_callback(Widget w, XtPointer client_data, XEvent *event, 
 void sbm_settings_button_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void sbm_settings_apply_callback(Widget w, XtPointer client_data, XtPointer call_data);
 void sbm_settings_close_callback(Widget w, XtPointer client_data, XtPointer call_data);
+
+/* 1D Profile functions */
+int read_profile_file(ProfileFile *pf, const char *path, int file_type);
+void free_profile_file(ProfileFile *pf);
+void init_profile_gui(ProfileData *pd, int argc, char **argv);
+void render_profile_canvas(ProfileData *pd);
+void draw_profile_plot(Display *dpy, Window win, GC plot_gc, ProfileData *pd,
+                       int file_idx, int col_idx, int time_idx,
+                       int width, int height, int log_x);
+void draw_profile_contour(Display *dpy, Window win, GC plot_gc, ProfileData *pd,
+                          int file_idx, int col_idx, int width, int height);
+void update_profile_info_label(ProfileData *pd);
+void profile_file_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void profile_var_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void profile_time_nav_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void profile_logx_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void profile_contour_callback(Widget w, XtPointer client_data, XtPointer call_data);
+void profile_canvas_expose_callback(Widget w, XtPointer client_data, XEvent *event, Boolean *continue_dispatch);
+void profile_rebuild_var_buttons(ProfileData *pd);
 
 /* Global pointer for callbacks */
 PlotfileData *global_pf = NULL;
@@ -6114,8 +6182,306 @@ void show_slice_statistics(PlotfileData *pf) {
 
     XtAddCallback(zlayer_button, XtNcallback, toggle_zlayer_callback, popup_data);
 
+    /* Time-Height Contour button (only useful with multiple timesteps) */
+    if (n_timesteps > 1) {
+        Widget thc_btn = XtVaCreateManagedWidget("Time-Profile Contour",
+            commandWidgetClass, popup_form,
+            XtNfromVert,  mean_canvas,
+            XtNfromHoriz, zlayer_button,
+            NULL);
+        XtAddCallback(thc_btn, XtNcallback, time_height_contour_callback, (XtPointer)pf);
+    }
+
     /* Show popup */
     XtPopup(popup_shell, XtGrabNone);
+}
+
+/* ============================================================
+ * Time-Height Contour popup
+ * ============================================================ */
+
+typedef struct {
+    Widget shell;
+    Widget canvas;
+    double *contour_data; /* [ntimes * nz] horizontal-mean values */
+    double *times;        /* [ntimes] simulation times */
+    double *z_values;     /* [nz] z physical coordinates */
+    int ntimes, nz;
+    double vmin, vmax;
+    char title[128];
+    char var_name[64];
+} TimeHeightContourData;
+
+static void draw_time_height_contour(Display *dpy, Window win, GC gc2,
+                                     TimeHeightContourData *thc,
+                                     int width, int height) {
+    XSetForeground(dpy, gc2, WhitePixel(dpy, screen));
+    XFillRectangle(dpy, win, gc2, 0, 0, width, height);
+    XSetForeground(dpy, gc2, BlackPixel(dpy, screen));
+    if (font) XSetFont(dpy, gc2, font->fid);
+
+    if (!thc || thc->ntimes < 1 || thc->nz < 1) {
+        XDrawString(dpy, win, gc2, 10, 20, "No data", 7);
+        XFlush(dpy); return;
+    }
+
+    int plot_left = 75, plot_right = width - 95;
+    int plot_top  = 30, plot_bottom = height - 45;
+    int plot_w = plot_right - plot_left;
+    int plot_h = plot_bottom - plot_top;
+    if (plot_w <= 0 || plot_h <= 0) return;
+
+    double tmin = thc->times[0], tmax = thc->times[thc->ntimes - 1];
+    if (tmin == tmax) tmax = tmin + 1.0;
+    double zmin = thc->z_values[0], zmax = thc->z_values[thc->nz - 1];
+    if (zmin == zmax) zmax = zmin + 1.0;
+    double vmin = thc->vmin, vmax = thc->vmax;
+    if (vmin == vmax) { vmin -= 0.5; vmax += 0.5; }
+
+    /* Render contour image */
+    XImage *img = XCreateImage(dpy, DefaultVisual(dpy, screen),
+                               DefaultDepth(dpy, screen), ZPixmap, 0,
+                               NULL, plot_w, plot_h, 32, 0);
+    if (img) {
+        img->data = (char *)malloc(img->bytes_per_line * plot_h);
+        if (img->data) {
+            for (int py = 0; py < plot_h; py++) {
+                /* Map pixel row → z (top=zmax, bottom=zmin) */
+                double z_frac = 1.0 - (double)py / (plot_h - 1);
+                double z_target = zmin + z_frac * (zmax - zmin);
+                /* Find nearest z index */
+                int zi = 0;
+                double best = fabs(thc->z_values[0] - z_target);
+                for (int i = 1; i < thc->nz; i++) {
+                    double d = fabs(thc->z_values[i] - z_target);
+                    if (d < best) { best = d; zi = i; }
+                }
+                for (int px = 0; px < plot_w; px++) {
+                    /* Map pixel col → time index */
+                    double t_frac = (double)px / (plot_w - 1);
+                    double t_target = tmin + t_frac * (tmax - tmin);
+                    int ti = 0;
+                    double bdt = fabs(thc->times[0] - t_target);
+                    for (int i = 1; i < thc->ntimes; i++) {
+                        double dt = fabs(thc->times[i] - t_target);
+                        if (dt < bdt) { bdt = dt; ti = i; }
+                    }
+                    double v = thc->contour_data[ti * thc->nz + zi];
+                    double t = (v - vmin) / (vmax - vmin);
+                    if (t < 0.0) t = 0.0; if (t > 1.0) t = 1.0;
+                    RGB rgb = viridis_colormap(t);
+                    unsigned long px_col = ((unsigned long)(rgb.r)<<16)|
+                                           ((unsigned long)(rgb.g)<<8)|(rgb.b);
+                    XPutPixel(img, px, py, px_col);
+                }
+            }
+            XPutImage(dpy, win, gc2, img, 0, 0, plot_left, plot_top, plot_w, plot_h);
+            free(img->data); img->data = NULL;
+        }
+        XDestroyImage(img);
+    }
+
+    /* Axes */
+    XSetForeground(dpy, gc2, BlackPixel(dpy, screen));
+    XDrawRectangle(dpy, win, gc2, plot_left, plot_top, plot_w, plot_h);
+
+    char lbl[64];
+    /* X (time) ticks */
+    for (int i = 0; i <= 5; i++) {
+        double t = tmin + (tmax - tmin) * i / 5;
+        int xp = plot_left + (int)((double)i / 5 * plot_w);
+        XDrawLine(dpy, win, gc2, xp, plot_bottom, xp, plot_bottom + 3);
+        profile_fmt_val(lbl, sizeof(lbl), t);
+        int lw = font ? XTextWidth(font, lbl, strlen(lbl)) : 40;
+        XDrawString(dpy, win, gc2, xp - lw/2, plot_bottom + 16, lbl, strlen(lbl));
+    }
+    /* Y (z) ticks */
+    for (int i = 0; i <= 6; i++) {
+        double z = zmin + (zmax - zmin) * i / 6;
+        int yp = plot_bottom - (int)((z - zmin) / (zmax - zmin) * plot_h);
+        XDrawLine(dpy, win, gc2, plot_left - 3, yp, plot_left, yp);
+        profile_fmt_val(lbl, sizeof(lbl), z);
+        int lw = font ? XTextWidth(font, lbl, strlen(lbl)) : 40;
+        XDrawString(dpy, win, gc2, plot_left - lw - 5, yp + 4, lbl, strlen(lbl));
+    }
+    /* Axis labels */
+    const char *xl = "time (s)";
+    int xlw = font ? XTextWidth(font, xl, strlen(xl)) : 50;
+    XDrawString(dpy, win, gc2, plot_left + (plot_w - xlw)/2, plot_bottom + 32, xl, strlen(xl));
+    XDrawString(dpy, win, gc2, 2, plot_top + 10, "z (m)", 5);
+    /* Title */
+    XDrawString(dpy, win, gc2, plot_left + 4, plot_top - 2, thc->title, strlen(thc->title));
+
+    /* Colorbar */
+    int cb_x = plot_right + 8, cb_w = 14;
+    for (int py = 0; py < plot_h; py++) {
+        double t = 1.0 - (double)py / (plot_h - 1);
+        RGB rgb = viridis_colormap(t);
+        unsigned long px_col = ((unsigned long)(rgb.r)<<16)|((unsigned long)(rgb.g)<<8)|(rgb.b);
+        XSetForeground(dpy, gc2, px_col);
+        XFillRectangle(dpy, win, gc2, cb_x, plot_top + py, cb_w, 1);
+    }
+    XSetForeground(dpy, gc2, BlackPixel(dpy, screen));
+    XDrawRectangle(dpy, win, gc2, cb_x, plot_top, cb_w, plot_h);
+    int lx = cb_x + cb_w + 4;
+    profile_fmt_val(lbl, sizeof(lbl), vmax);
+    XDrawLine(dpy, win, gc2, cb_x, plot_top, cb_x + cb_w + 3, plot_top);
+    XDrawString(dpy, win, gc2, lx, plot_top + 10, lbl, strlen(lbl));
+    profile_fmt_val(lbl, sizeof(lbl), (vmin + vmax) * 0.5);
+    int mid_y = plot_top + plot_h / 2;
+    XDrawLine(dpy, win, gc2, cb_x, mid_y, cb_x + cb_w + 3, mid_y);
+    XDrawString(dpy, win, gc2, lx, mid_y + 4, lbl, strlen(lbl));
+    profile_fmt_val(lbl, sizeof(lbl), vmin);
+    XDrawLine(dpy, win, gc2, cb_x, plot_bottom, cb_x + cb_w + 3, plot_bottom);
+    XDrawString(dpy, win, gc2, lx, plot_bottom + 4, lbl, strlen(lbl));
+
+    XFlush(dpy);
+}
+
+static void time_height_expose_handler(Widget w, XtPointer client_data,
+                                       XEvent *event, Boolean *cont) {
+    (void)event; (void)cont;
+    TimeHeightContourData *thc = (TimeHeightContourData *)client_data;
+    Window win = XtWindow(w);
+    unsigned int wd, ht, bw, depth;
+    Window root; int x, y;
+    XGetGeometry(display, win, &root, &x, &y, &wd, &ht, &bw, &depth);
+    GC gc2 = XCreateGC(display, win, 0, NULL);
+    if (font) XSetFont(display, gc2, font->fid);
+    draw_time_height_contour(display, win, gc2, thc, (int)wd, (int)ht);
+    XFreeGC(display, gc2);
+}
+
+static void time_height_close_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    (void)w; (void)call_data;
+    TimeHeightContourData *thc = (TimeHeightContourData *)client_data;
+    if (thc) {
+        XtDestroyWidget(thc->shell);
+        if (thc->contour_data) free(thc->contour_data);
+        if (thc->times)        free(thc->times);
+        if (thc->z_values)     free(thc->z_values);
+        free(thc);
+    }
+}
+
+void show_time_height_contour(PlotfileData *pf) {
+    if (n_timesteps < 2) {
+        /* nothing to show for a single timestep */
+        fprintf(stderr, "Time-Height Contour requires multiple timesteps.\n");
+        return;
+    }
+
+    int var_idx  = pf->current_var;
+    int saved_ts = current_timestep;
+
+    /* We use axis 2 (z) as the height axis always */
+    int nz = pf->grid_dims[2];
+    (void)pf->grid_dims[0]; (void)pf->grid_dims[1]; /* nx/ny read per-timestep below */
+
+    TimeHeightContourData *thc = (TimeHeightContourData *)calloc(1, sizeof(TimeHeightContourData));
+    thc->ntimes       = n_timesteps;
+    thc->nz           = nz;
+    thc->contour_data = (double *)malloc(n_timesteps * nz * sizeof(double));
+    thc->times        = (double *)malloc(n_timesteps * sizeof(double));
+    thc->z_values     = (double *)malloc(nz * sizeof(double));
+
+    /* Fill z physical coords from current plotfile */
+    double dz = (pf->prob_hi[2] - pf->prob_lo[2]) / nz;
+    for (int k = 0; k < nz; k++)
+        thc->z_values[k] = pf->prob_lo[2] + (k + 0.5) * dz;
+
+    thc->vmin =  1e300;
+    thc->vmax = -1e300;
+
+    /* Iterate over all timesteps, compute horizontal mean per z-level */
+    for (int ti = 0; ti < n_timesteps; ti++) {
+        /* Load this timestep's data without triggering GUI updates */
+        PlotfileData tmp_pf;
+        memset(&tmp_pf, 0, sizeof(tmp_pf));
+        strncpy(tmp_pf.plotfile_dir, timestep_paths[ti], MAX_PATH - 1);
+        tmp_pf.current_var  = var_idx;
+        tmp_pf.slice_axis   = pf->slice_axis;
+        tmp_pf.slice_idx    = pf->slice_idx;
+        tmp_pf.colormap     = pf->colormap;
+        tmp_pf.current_level = 0;
+
+        if (read_header(&tmp_pf) < 0)        { thc->times[ti] = ti; continue; }
+        if (read_cell_h(&tmp_pf) < 0)        { thc->times[ti] = tmp_pf.time; continue; }
+        if (read_variable_data(&tmp_pf, var_idx) < 0) { thc->times[ti] = tmp_pf.time; continue; }
+
+        thc->times[ti] = tmp_pf.time;
+
+        int tnx = tmp_pf.grid_dims[0];
+        int tny = tmp_pf.grid_dims[1];
+        int tnz = tmp_pf.grid_dims[2];
+        int use_nz = (tnz < nz) ? tnz : nz;
+
+        for (int k = 0; k < use_nz; k++) {
+            double sum = 0.0;
+            long count = 0;
+            for (int j = 0; j < tny; j++) {
+                for (int i = 0; i < tnx; i++) {
+                    long idx = (long)k * tnx * tny + (long)j * tnx + i;
+                    if (idx < (long)tnx * tny * tnz) {
+                        sum += tmp_pf.data[idx];
+                        count++;
+                    }
+                }
+            }
+            double mean_val = (count > 0) ? sum / count : 0.0;
+            thc->contour_data[ti * nz + k] = mean_val;
+            if (mean_val < thc->vmin) thc->vmin = mean_val;
+            if (mean_val > thc->vmax) thc->vmax = mean_val;
+        }
+        /* Zero-fill any extra z levels if tnz < nz */
+        for (int k = use_nz; k < nz; k++)
+            thc->contour_data[ti * nz + k] = 0.0;
+
+        if (tmp_pf.data) { free(tmp_pf.data); tmp_pf.data = NULL; }
+    }
+
+    /* Restore original state */
+    strncpy(pf->plotfile_dir, timestep_paths[saved_ts], MAX_PATH - 1);
+
+    snprintf(thc->title, sizeof(thc->title),
+             "Time-Height Contour: %s (horiz. mean)", pf->variables[var_idx]);
+    strncpy(thc->var_name, pf->variables[var_idx], sizeof(thc->var_name) - 1);
+
+    /* Create popup */
+    Widget shell = XtVaCreatePopupShell("Time-Height Contour",
+        transientShellWidgetClass, toplevel,
+        XtNwidth,  860,
+        XtNheight, 520,
+        NULL);
+    thc->shell = shell;
+
+    Widget frm = XtVaCreateManagedWidget("form", formWidgetClass, shell, NULL);
+
+    Widget cnv = XtVaCreateManagedWidget("thContour",
+        simpleWidgetClass, frm,
+        XtNwidth,  840, XtNheight, 460,
+        XtNborderWidth, 1,
+        XtNtop,    XawChainTop,
+        XtNbottom, XawChainBottom,
+        XtNleft,   XawChainLeft,
+        XtNright,  XawChainRight,
+        NULL);
+    thc->canvas = cnv;
+    XtAddEventHandler(cnv, ExposureMask, False, time_height_expose_handler, thc);
+
+    Widget close_btn = XtVaCreateManagedWidget("Close",
+        commandWidgetClass, frm,
+        XtNfromVert, cnv,
+        NULL);
+    XtAddCallback(close_btn, XtNcallback, time_height_close_callback, thc);
+
+    XtPopup(shell, XtGrabNone);
+}
+
+static void time_height_contour_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    (void)w; (void)call_data;
+    PlotfileData *pf = (PlotfileData *)client_data;
+    if (pf && pf->data) show_time_height_contour(pf);
 }
 
 /* Profile button callback */
@@ -10237,6 +10603,744 @@ void init_sbm_gui(SBMData *sbm, const char *plotfile_dir, int argc, char **argv)
     XSelectInput(display, sbm_canvas, ExposureMask | KeyPressMask);
 }
 
+/* ============================================================
+ * 1D Profile viewer implementation
+ * ============================================================ */
+
+/* Column name tables for each file type */
+static const char *profile_col_names_surf[]    = {"time","u_star","t_star","olen",NULL};
+static const char *profile_col_names_mean[]    = {"time","z","u","v","w","rho","theta","ksgs","Kmv","Khv","qv","qc","qr","qi","qs","qg",NULL};
+static const char *profile_col_names_flux[]    = {"time","z","u'u'","u'v'","u'w'","v'v'","v'w'","w'w'","u'th'","v'th'","w'th'","th'th'","uiuiu'","uiuiv'","uiuiw'","p'u'","p'v'","p'w'","w'qv'","w'qc'","w'qr'","w'thv'",NULL};
+static const char *profile_col_names_subgrid[] = {"time","z","tau11","tau12","tau13","tau22","tau23","tau33","sgshfx","sgsq1fx","sgsq2fx","sgsdiss",NULL};
+static const char *profile_file_labels[N_PROFILE_FILES] = {"surf","mean","flux","subgrid"};
+
+int read_profile_file(ProfileFile *pf, const char *path, int file_type) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+
+    /* Set column names from table */
+    const char **names = NULL;
+    switch (file_type) {
+        case PROFILE_FILE_SURF:    names = profile_col_names_surf;    pf->has_z = 0; break;
+        case PROFILE_FILE_MEAN:    names = profile_col_names_mean;    pf->has_z = 1; break;
+        case PROFILE_FILE_FLUX:    names = profile_col_names_flux;    pf->has_z = 1; break;
+        case PROFILE_FILE_SUBGRID: names = profile_col_names_subgrid; pf->has_z = 1; break;
+        default: fclose(fp); return -1;
+    }
+    pf->ncols = 0;
+    while (names[pf->ncols]) {
+        strncpy(pf->col_names[pf->ncols], names[pf->ncols], 31);
+        pf->col_names[pf->ncols][31] = '\0';
+        pf->ncols++;
+    }
+    strncpy(pf->filename, profile_file_labels[file_type], 255);
+
+    /* Allocate data buffer */
+    int capacity = 4096;
+    pf->data = (double *)malloc(capacity * pf->ncols * sizeof(double));
+    if (!pf->data) { fclose(fp); return -1; }
+    pf->nrows = 0;
+
+    char line[4096];
+    while (fgets(line, sizeof(line), fp)) {
+        /* Skip header lines (start with non-numeric after whitespace) */
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\n' || *p == '\r') continue;
+        /* Try to detect header: if first token can't be parsed as a double, skip */
+        char *end;
+        strtod(p, &end);
+        if (end == p) continue;  /* Not a number, skip header row */
+
+        /* Parse pf->ncols doubles */
+        if (pf->nrows >= capacity) {
+            if (capacity >= MAX_PROFILE_ROWS) break;
+            capacity *= 2;
+            if (capacity > MAX_PROFILE_ROWS) capacity = MAX_PROFILE_ROWS;
+            double *tmp = (double *)realloc(pf->data, capacity * pf->ncols * sizeof(double));
+            if (!tmp) break;
+            pf->data = tmp;
+        }
+
+        double *row = pf->data + pf->nrows * pf->ncols;
+        char *tok = strtok(line, " \t\n\r");
+        int col = 0;
+        while (tok && col < pf->ncols) {
+            row[col++] = strtod(tok, NULL);
+            tok = strtok(NULL, " \t\n\r");
+        }
+        if (col < pf->ncols) {
+            /* Partial row: zero-fill */
+            while (col < pf->ncols) row[col++] = 0.0;
+        }
+        pf->nrows++;
+    }
+    fclose(fp);
+
+    if (pf->nrows == 0) {
+        free(pf->data); pf->data = NULL;
+        return -1;
+    }
+
+    /* Build unique times array and determine nz */
+    if (pf->has_z) {
+        /* Count unique times (time is column 0) */
+        int times_cap = 4096;
+        pf->times = (double *)malloc(times_cap * sizeof(double));
+        pf->ntimes = 0;
+        pf->z_min = pf->data[1];
+        pf->z_max = pf->data[1];
+        for (int r = 0; r < pf->nrows; r++) {
+            double t = pf->data[r * pf->ncols + 0];
+            double z = pf->data[r * pf->ncols + 1];
+            if (z < pf->z_min) pf->z_min = z;
+            if (z > pf->z_max) pf->z_max = z;
+            /* Check if t already seen */
+            int found = 0;
+            for (int i = 0; i < pf->ntimes; i++) {
+                if (fabs(pf->times[i] - t) < 1e-15 * (1.0 + fabs(t))) { found = 1; break; }
+            }
+            if (!found) {
+                if (pf->ntimes >= times_cap) {
+                    times_cap *= 2;
+                    double *tmp = (double *)realloc(pf->times, times_cap * sizeof(double));
+                    if (!tmp) break;
+                    pf->times = tmp;
+                }
+                pf->times[pf->ntimes++] = t;
+            }
+        }
+        /* nz = rows per timestep (assume uniform) */
+        if (pf->ntimes > 0)
+            pf->nz = pf->nrows / pf->ntimes;
+        else
+            pf->nz = pf->nrows;
+    } else {
+        /* surf: all rows are individual timesteps */
+        pf->ntimes = pf->nrows;
+        pf->nz = 1;
+        pf->times = (double *)malloc(pf->nrows * sizeof(double));
+        for (int r = 0; r < pf->nrows; r++)
+            pf->times[r] = pf->data[r * pf->ncols + 0];
+    }
+
+    printf("Profile: loaded %s (%d rows, %d cols, %d timesteps, %d z-levels)\n",
+           pf->filename, pf->nrows, pf->ncols, pf->ntimes, pf->nz);
+    return 0;
+}
+
+void free_profile_file(ProfileFile *pf) {
+    if (pf->data)  { free(pf->data);  pf->data  = NULL; }
+    if (pf->times) { free(pf->times); pf->times = NULL; }
+    pf->nrows = 0; pf->ntimes = 0;
+}
+
+/* Helper: nice tick labels */
+void profile_fmt_val(char *buf, int bufsz, double v) {
+    double av = fabs(v);
+    if (av == 0.0)                    snprintf(buf, bufsz, "0");
+    else if (av >= 1e4 || av < 1e-3) snprintf(buf, bufsz, "%.2e", v);
+    else if (av >= 100)               snprintf(buf, bufsz, "%.1f", v);
+    else if (av >= 1)                 snprintf(buf, bufsz, "%.3g", v);
+    else                              snprintf(buf, bufsz, "%.3g", v);
+}
+
+void draw_profile_plot(Display *dpy, Window win, GC plot_gc, ProfileData *pd,
+                       int file_idx, int col_idx, int time_idx,
+                       int width, int height, int log_x) {
+    ProfileFile *pf = &pd->files[file_idx];
+
+    XSetForeground(dpy, plot_gc, WhitePixel(dpy, screen));
+    XFillRectangle(dpy, win, plot_gc, 0, 0, width, height);
+    XSetForeground(dpy, plot_gc, BlackPixel(dpy, screen));
+    if (font) XSetFont(dpy, plot_gc, font->fid);
+
+    if (!pf || pf->nrows == 0 || col_idx < 0 || col_idx >= pf->ncols) {
+        XDrawString(dpy, win, plot_gc, width/2-20, height/2, "No data", 7);
+        XFlush(dpy); return;
+    }
+
+    int plot_left = 75, plot_right = width - 20;
+    int plot_top = 30, plot_bottom = height - 45;
+    int plot_w = plot_right - plot_left;
+    int plot_h = plot_bottom - plot_top;
+    if (plot_w <= 0 || plot_h <= 0) return;
+
+    char label[64];
+
+    if (pf->has_z) {
+        double t_target = (time_idx < pf->ntimes) ? pf->times[time_idx] : pf->times[0];
+
+        /* Collect (val, z) for this timestep */
+        int n = 0;
+        double vals_buf[8192], z_buf[8192];
+        for (int r = 0; r < pf->nrows && n < 8192; r++) {
+            double t = pf->data[r * pf->ncols + 0];
+            if (fabs(t - t_target) > 1e-10 * (1.0 + fabs(t_target))) continue;
+            z_buf[n]    = pf->data[r * pf->ncols + 1];
+            vals_buf[n] = pf->data[r * pf->ncols + col_idx];
+            n++;
+        }
+        if (n == 0) {
+            XDrawString(dpy, win, plot_gc, 10, height/2, "No data for this timestep", 25);
+            XFlush(dpy); return;
+        }
+
+        double vmin = vals_buf[0], vmax = vals_buf[0];
+        for (int i = 1; i < n; i++) {
+            if (vals_buf[i] < vmin) vmin = vals_buf[i];
+            if (vals_buf[i] > vmax) vmax = vals_buf[i];
+        }
+        if (vmin == vmax) { vmin -= 0.5; vmax += 0.5; }
+
+        double zmin = pf->z_min, zmax = pf->z_max;
+        if (zmin == zmax) { zmax = zmin + 1.0; }
+
+        int use_log = log_x && vmin > 0.0;
+        double lv0 = use_log ? log10(vmin) : 0;
+        double lv1 = use_log ? log10(vmax) : 0;
+
+        /* Axes */
+        XDrawLine(dpy, win, plot_gc, plot_left, plot_bottom, plot_right, plot_bottom);
+        XDrawLine(dpy, win, plot_gc, plot_left, plot_top,    plot_left,  plot_bottom);
+        if (!use_log && vmin < 0.0 && vmax > 0.0) {
+            int x0 = plot_left + (int)((-vmin) / (vmax - vmin) * plot_w);
+            XSetForeground(dpy, plot_gc, 0xBBBBBB);
+            XDrawLine(dpy, win, plot_gc, x0, plot_top, x0, plot_bottom);
+            XSetForeground(dpy, plot_gc, BlackPixel(dpy, screen));
+        }
+
+        /* X ticks */
+        for (int i = 0; i <= 5; i++) {
+            double f = (double)i / 5;
+            double val = use_log ? pow(10.0, lv0 + f*(lv1-lv0)) : vmin + f*(vmax-vmin);
+            int xp = plot_left + (int)(f * plot_w);
+            XDrawLine(dpy, win, plot_gc, xp, plot_bottom, xp, plot_bottom+3);
+            profile_fmt_val(label, sizeof(label), val);
+            int lw = font ? XTextWidth(font, label, strlen(label)) : 40;
+            XDrawString(dpy, win, plot_gc, xp - lw/2, plot_bottom+16, label, strlen(label));
+        }
+        /* Y (z) ticks */
+        for (int i = 0; i <= 6; i++) {
+            double z = zmin + (zmax-zmin) * i / 6;
+            int yp = plot_bottom - (int)((z-zmin)/(zmax-zmin) * plot_h);
+            XDrawLine(dpy, win, plot_gc, plot_left-3, yp, plot_left, yp);
+            profile_fmt_val(label, sizeof(label), z);
+            int lw = font ? XTextWidth(font, label, strlen(label)) : 40;
+            XDrawString(dpy, win, plot_gc, plot_left-lw-5, yp+4, label, strlen(label));
+        }
+        /* Axis labels */
+        int xlw = font ? XTextWidth(font, pf->col_names[col_idx], strlen(pf->col_names[col_idx])) : 40;
+        XDrawString(dpy, win, plot_gc, plot_left+(plot_w-xlw)/2, plot_bottom+32, pf->col_names[col_idx], strlen(pf->col_names[col_idx]));
+        XDrawString(dpy, win, plot_gc, 2, plot_top+10, "z(m)", 4);
+        char tlabel[64];
+        snprintf(tlabel, sizeof(tlabel), "t=%.4g s  [%d/%d]", t_target, time_idx+1, pf->ntimes);
+        XDrawString(dpy, win, plot_gc, plot_left+4, plot_top-2, tlabel, strlen(tlabel));
+
+        /* Profile line */
+        XSetForeground(dpy, plot_gc, 0x0000CC);
+        int px0 = -1, py0 = -1;
+        for (int i = 0; i < n; i++) {
+            double fx, fy;
+            if (use_log) {
+                if (vals_buf[i] <= 0.0) { px0=-1; continue; }
+                fx = (log10(vals_buf[i]) - lv0) / (lv1 - lv0);
+            } else {
+                fx = (vals_buf[i] - vmin) / (vmax - vmin);
+            }
+            fy = (z_buf[i] - zmin) / (zmax - zmin);
+            int px = plot_left + (int)(fx * plot_w);
+            int py = plot_bottom - (int)(fy * plot_h);
+            if (px < plot_left)   px = plot_left;
+            if (px > plot_right)  px = plot_right;
+            if (py < plot_top)    py = plot_top;
+            if (py > plot_bottom) py = plot_bottom;
+            if (px0 >= 0) XDrawLine(dpy, win, plot_gc, px0, py0, px, py);
+            XFillRectangle(dpy, win, plot_gc, px-1, py-1, 3, 3);
+            px0 = px; py0 = py;
+        }
+
+    } else {
+        /* Surf: time-series. X=time, Y=variable */
+        if (col_idx == 0) col_idx = 1;
+        if (col_idx >= pf->ncols) { XDrawString(dpy,win,plot_gc,10,height/2,"Select variable",15); XFlush(dpy); return; }
+
+        double tmin = pf->times[0], tmax = pf->times[pf->ntimes-1];
+        if (tmin == tmax) tmax = tmin+1.0;
+        double vmin = pf->data[col_idx], vmax = pf->data[col_idx];
+        for (int r = 0; r < pf->nrows; r++) {
+            double v = pf->data[r*pf->ncols+col_idx];
+            if (v < vmin) vmin=v; if (v > vmax) vmax=v;
+        }
+        if (vmin == vmax) { vmin -= 0.5; vmax += 0.5; }
+
+        XDrawLine(dpy, win, plot_gc, plot_left, plot_bottom, plot_right, plot_bottom);
+        XDrawLine(dpy, win, plot_gc, plot_left, plot_top,    plot_left,  plot_bottom);
+        for (int i = 0; i <= 5; i++) {
+            double t = tmin + (tmax-tmin)*i/5;
+            int xp = plot_left + (int)((double)i/5 * plot_w);
+            XDrawLine(dpy, win, plot_gc, xp, plot_bottom, xp, plot_bottom+3);
+            profile_fmt_val(label, sizeof(label), t);
+            int lw = font ? XTextWidth(font, label, strlen(label)) : 40;
+            XDrawString(dpy, win, plot_gc, xp-lw/2, plot_bottom+16, label, strlen(label));
+        }
+        for (int i = 0; i <= 5; i++) {
+            double v = vmin + (vmax-vmin)*i/5;
+            int yp = plot_bottom - (int)((double)i/5 * plot_h);
+            XDrawLine(dpy, win, plot_gc, plot_left-3, yp, plot_left, yp);
+            profile_fmt_val(label, sizeof(label), v);
+            int lw = font ? XTextWidth(font, label, strlen(label)) : 40;
+            XDrawString(dpy, win, plot_gc, plot_left-lw-5, yp+4, label, strlen(label));
+        }
+        const char *xl = "time (s)";
+        int xlw = font ? XTextWidth(font, xl, strlen(xl)) : 50;
+        XDrawString(dpy, win, plot_gc, plot_left+(plot_w-xlw)/2, plot_bottom+32, xl, strlen(xl));
+        XDrawString(dpy, win, plot_gc, 2, plot_top+10, pf->col_names[col_idx], strlen(pf->col_names[col_idx]));
+
+        XSetForeground(dpy, plot_gc, 0x0000CC);
+        int px0=-1, py0=-1;
+        for (int r = 0; r < pf->nrows; r++) {
+            double t = pf->data[r*pf->ncols+0];
+            double v = pf->data[r*pf->ncols+col_idx];
+            int px = plot_left + (int)((t-tmin)/(tmax-tmin)*plot_w);
+            int py = plot_bottom - (int)((v-vmin)/(vmax-vmin)*plot_h);
+            if (px<plot_left) px=plot_left; if (px>plot_right) px=plot_right;
+            if (py<plot_top)  py=plot_top;  if (py>plot_bottom) py=plot_bottom;
+            if (px0>=0) XDrawLine(dpy, win, plot_gc, px0, py0, px, py);
+            XFillRectangle(dpy, win, plot_gc, px-1, py-1, 3, 3);
+            px0=px; py0=py;
+        }
+    }
+    XSetForeground(dpy, plot_gc, BlackPixel(dpy, screen));
+    XFlush(dpy);
+}
+
+void draw_profile_contour(Display *dpy, Window win, GC plot_gc, ProfileData *pd,
+                          int file_idx, int col_idx, int width, int height) {
+    ProfileFile *pf = &pd->files[file_idx];
+
+    XSetForeground(dpy, plot_gc, WhitePixel(dpy, screen));
+    XFillRectangle(dpy, win, plot_gc, 0, 0, width, height);
+    XSetForeground(dpy, plot_gc, BlackPixel(dpy, screen));
+    if (font) XSetFont(dpy, plot_gc, font->fid);
+
+    if (!pf || !pf->has_z || pf->ntimes < 1 || pf->nz < 1 ||
+        col_idx < 2 || col_idx >= pf->ncols) {
+        const char *msg = "No profile data for contour";
+        XDrawString(dpy, win, plot_gc, width/2-60, height/2, msg, strlen(msg));
+        XFlush(dpy); return;
+    }
+
+    int plot_left = 75, plot_right = width - 95;  /* leave ~90px for colorbar + labels */
+    int plot_top = 30, plot_bottom = height - 45;
+    int plot_w = plot_right - plot_left;
+    int plot_h = plot_bottom - plot_top;
+    if (plot_w <= 0 || plot_h <= 0) return;
+
+    /* Find global min/max of the variable across all timesteps */
+    double vmin = 1e300, vmax = -1e300;
+    for (int r = 0; r < pf->nrows; r++) {
+        double v = pf->data[r * pf->ncols + col_idx];
+        if (v < vmin) vmin = v;
+        if (v > vmax) vmax = v;
+    }
+    if (vmin == vmax) { vmin -= 0.5; vmax += 0.5; }
+
+    double zmin = pf->z_min, zmax = pf->z_max;
+    if (zmin == zmax) zmax = zmin + 1.0;
+    double tmin = pf->times[0], tmax = pf->times[pf->ntimes-1];
+    if (tmin == tmax) tmax = tmin + 1.0;
+
+    /* Render pixel by pixel using XImage */
+    XImage *img = XCreateImage(dpy, DefaultVisual(dpy, screen), DefaultDepth(dpy, screen),
+                               ZPixmap, 0, NULL, plot_w, plot_h, 32, 0);
+    if (!img) goto draw_axes_only;
+    img->data = (char *)malloc(img->bytes_per_line * plot_h);
+    if (!img->data) { XDestroyImage(img); goto draw_axes_only; }
+
+    /* Build lookup: for each pixel column, which time index? */
+    /* For each pixel row, which z index (nearest neighbor)? */
+    for (int py = 0; py < plot_h; py++) {
+        /* z from top=zmax to bottom=zmin */
+        double z_frac = 1.0 - (double)py / (plot_h - 1);
+        double z_target = zmin + z_frac * (zmax - zmin);
+
+        for (int px = 0; px < plot_w; px++) {
+            /* map px to time index */
+            double t_frac = (double)px / (plot_w - 1);
+            double t_target = tmin + t_frac * (tmax - tmin);
+
+            /* Find nearest time index */
+            int ti = 0;
+            double best_dt = fabs(pf->times[0] - t_target);
+            for (int i = 1; i < pf->ntimes; i++) {
+                double dt = fabs(pf->times[i] - t_target);
+                if (dt < best_dt) { best_dt = dt; ti = i; }
+            }
+
+            /* Find nearest z row within this timestep */
+            /* Rows for timestep ti start at ti*nz (assuming uniform layout) */
+            int row_start = ti * pf->nz;
+            int zi = 0;
+            double best_dz = 1e300;
+            for (int i = 0; i < pf->nz && (row_start + i) < pf->nrows; i++) {
+                double z = pf->data[(row_start + i) * pf->ncols + 1];
+                double dz = fabs(z - z_target);
+                if (dz < best_dz) { best_dz = dz; zi = i; }
+            }
+
+            int row = row_start + zi;
+            double v = (row < pf->nrows) ? pf->data[row * pf->ncols + col_idx] : 0.0;
+            double t = (v - vmin) / (vmax - vmin);
+            if (t < 0.0) t = 0.0;
+            if (t > 1.0) t = 1.0;
+
+            RGB rgb = viridis_colormap(t);
+            unsigned long pixel = ((unsigned long)(rgb.r) << 16) |
+                                  ((unsigned long)(rgb.g) << 8)  |
+                                  ((unsigned long)(rgb.b));
+            XPutPixel(img, px, py, pixel);
+        }
+    }
+    XPutImage(dpy, win, plot_gc, img, 0, 0, plot_left, plot_top, plot_w, plot_h);
+    free(img->data); img->data = NULL;
+    XDestroyImage(img);
+
+draw_axes_only:
+    XSetForeground(dpy, plot_gc, BlackPixel(dpy, screen));
+    XDrawRectangle(dpy, win, plot_gc, plot_left, plot_top, plot_w, plot_h);
+
+    /* X (time) ticks */
+    char label[64];
+    for (int i = 0; i <= 5; i++) {
+        double t = tmin + (tmax-tmin)*i/5;
+        int xp = plot_left + (int)((double)i/5 * plot_w);
+        XDrawLine(dpy, win, plot_gc, xp, plot_bottom, xp, plot_bottom+3);
+        profile_fmt_val(label, sizeof(label), t);
+        int lw = font ? XTextWidth(font, label, strlen(label)) : 40;
+        XDrawString(dpy, win, plot_gc, xp-lw/2, plot_bottom+16, label, strlen(label));
+    }
+    /* Y (z) ticks */
+    for (int i = 0; i <= 6; i++) {
+        double z = zmin + (zmax-zmin)*i/6;
+        int yp = plot_bottom - (int)((z-zmin)/(zmax-zmin)*plot_h);
+        XDrawLine(dpy, win, plot_gc, plot_left-3, yp, plot_left, yp);
+        profile_fmt_val(label, sizeof(label), z);
+        int lw = font ? XTextWidth(font, label, strlen(label)) : 40;
+        XDrawString(dpy, win, plot_gc, plot_left-lw-5, yp+4, label, strlen(label));
+    }
+    const char *xl = "time (s)";
+    int xlw = font ? XTextWidth(font, xl, strlen(xl)) : 50;
+    XDrawString(dpy, win, plot_gc, plot_left+(plot_w-xlw)/2, plot_bottom+32, xl, strlen(xl));
+    XDrawString(dpy, win, plot_gc, 2, plot_top+10, "z(m)", 4);
+
+    /* Colorbar: right side strip (cb_x is 8px right of plot area) */
+    int cb_x = plot_right + 8, cb_w = 14;
+    for (int py = 0; py < plot_h; py++) {
+        double t = 1.0 - (double)py / (plot_h - 1);
+        RGB rgb = viridis_colormap(t);
+        unsigned long px_col = ((unsigned long)(rgb.r)<<16)|((unsigned long)(rgb.g)<<8)|(rgb.b);
+        XSetForeground(dpy, plot_gc, px_col);
+        XFillRectangle(dpy, win, plot_gc, cb_x, plot_top + py, cb_w, 1);
+    }
+    XSetForeground(dpy, plot_gc, BlackPixel(dpy, screen));
+    XDrawRectangle(dpy, win, plot_gc, cb_x, plot_top, cb_w, plot_h);
+    /* Colorbar tick labels: max, mid, min */
+    int lx = cb_x + cb_w + 4;
+    profile_fmt_val(label, sizeof(label), vmax);
+    XDrawLine(dpy, win, plot_gc, cb_x, plot_top, cb_x + cb_w + 3, plot_top);
+    XDrawString(dpy, win, plot_gc, lx, plot_top + 10, label, strlen(label));
+    profile_fmt_val(label, sizeof(label), (vmin + vmax) * 0.5);
+    int mid_y = plot_top + plot_h / 2;
+    XDrawLine(dpy, win, plot_gc, cb_x, mid_y, cb_x + cb_w + 3, mid_y);
+    XDrawString(dpy, win, plot_gc, lx, mid_y + 4, label, strlen(label));
+    profile_fmt_val(label, sizeof(label), vmin);
+    XDrawLine(dpy, win, plot_gc, cb_x, plot_bottom, cb_x + cb_w + 3, plot_bottom);
+    XDrawString(dpy, win, plot_gc, lx, plot_bottom + 4, label, strlen(label));
+
+    /* Title */
+    snprintf(label, sizeof(label), "%s  [contour]", pf->col_names[col_idx]);
+    XDrawString(dpy, win, plot_gc, plot_left+4, plot_top-2, label, strlen(label));
+
+    XFlush(dpy);
+}
+
+void render_profile_canvas(ProfileData *pd) {
+    if (!pd || profile_canvas == 0) return;
+    int file_idx = profile_current_file;
+    if (!pd->loaded[file_idx]) {
+        for (int i = 0; i < N_PROFILE_FILES; i++)
+            if (pd->loaded[i]) { file_idx = i; break; }
+    }
+    unsigned int w = 0, h = 0;
+    Window root; int x, y; unsigned int bw, depth;
+    XGetGeometry(display, profile_canvas, &root, &x, &y, &w, &h, &bw, &depth);
+    if ((int)w <= 0 || (int)h <= 0) return;
+    GC gc2 = XCreateGC(display, profile_canvas, 0, NULL);
+    if (font) XSetFont(display, gc2, font->fid);
+    if (profile_contour_mode && pd->files[file_idx].has_z)
+        draw_profile_contour(display, profile_canvas, gc2, pd, file_idx, profile_current_col, w, h);
+    else
+        draw_profile_plot(display, profile_canvas, gc2, pd, file_idx, profile_current_col,
+                          profile_current_time_idx, w, h, profile_log_x);
+    XFreeGC(display, gc2);
+}
+
+void update_profile_info_label(ProfileData *pd) {
+    if (!pd || !profile_info_label) return;
+    int fi = profile_current_file;
+    if (!pd->loaded[fi]) { XtVaSetValues(profile_info_label, XtNlabel, "No data for this file", NULL); return; }
+    ProfileFile *pf = &pd->files[fi];
+    char buf[256];
+    const char *mode = profile_contour_mode ? "contour" : "profile";
+    if (pf->has_z && pf->ntimes > 0 && !profile_contour_mode) {
+        double t = pf->times[profile_current_time_idx];
+        snprintf(buf, sizeof(buf), "%s | %s | t=%.4g s [%d/%d] | %s",
+                 pf->filename, pf->col_names[profile_current_col],
+                 t, profile_current_time_idx+1, pf->ntimes, mode);
+    } else {
+        snprintf(buf, sizeof(buf), "%s | %s | %d timesteps | %s",
+                 pf->filename, pf->col_names[profile_current_col], pf->ntimes, mode);
+    }
+    XtVaSetValues(profile_info_label, XtNlabel, buf, NULL);
+}
+
+void profile_canvas_expose_callback(Widget w, XtPointer client_data, XEvent *event, Boolean *cont) {
+    (void)w; (void)client_data; (void)event; (void)cont;
+    render_profile_canvas(global_profile);
+}
+
+void profile_rebuild_var_buttons(ProfileData *pd) {
+    if (!profile_var_viewport) return;
+
+    /* Destroy old inner box and replace with a fresh one */
+    if (profile_var_box_widget) {
+        XtDestroyWidget(profile_var_box_widget);
+        profile_var_box_widget = NULL;
+    }
+    if (profile_var_buttons) { free(profile_var_buttons); profile_var_buttons = NULL; }
+    profile_n_var_buttons = 0;
+
+    int fi = profile_current_file;
+    if (!pd || !pd->loaded[fi]) return;
+    ProfileFile *pf = &pd->files[fi];
+
+    /* New inner box */
+    Arg args[4]; int n;
+    n = 0;
+    XtSetArg(args[n], XtNorientation, XtorientVertical); n++;
+    profile_var_box_widget = XtCreateManagedWidget("varInnerBox", boxWidgetClass,
+                                                    profile_var_viewport, args, n);
+
+    int start = pf->has_z ? 2 : 1;
+    int nbtns = pf->ncols - start;
+    if (nbtns <= 0) { XtRealizeWidget(profile_var_box_widget); return; }
+
+    profile_var_buttons = (Widget *)malloc(nbtns * sizeof(Widget));
+    profile_n_var_buttons = nbtns;
+
+    for (int i = 0; i < nbtns; i++) {
+        int col = start + i;
+        n = 0;
+        XtSetArg(args[n], XtNlabel, pf->col_names[col]); n++;
+        profile_var_buttons[i] = XtCreateManagedWidget(pf->col_names[col],
+            commandWidgetClass, profile_var_box_widget, args, n);
+        XtAddCallback(profile_var_buttons[i], XtNcallback, profile_var_callback, (XtPointer)(long)col);
+    }
+    XtRealizeWidget(profile_var_box_widget);
+}
+
+void profile_file_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    (void)w; (void)call_data;
+    int fi = (int)(long)client_data;
+    if (!global_profile || !global_profile->loaded[fi]) return;
+    profile_current_file = fi;
+    ProfileFile *pf = &global_profile->files[fi];
+    profile_current_col = pf->has_z ? 2 : 1;
+    if (profile_current_col >= pf->ncols) profile_current_col = 0;
+    profile_current_time_idx = 0;
+    profile_rebuild_var_buttons(global_profile);
+    update_profile_info_label(global_profile);
+    render_profile_canvas(global_profile);
+}
+
+void profile_var_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    (void)w; (void)call_data;
+    profile_current_col = (int)(long)client_data;
+    update_profile_info_label(global_profile);
+    render_profile_canvas(global_profile);
+}
+
+void profile_time_nav_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    (void)w; (void)call_data;
+    int dir = (int)(long)client_data;
+    if (!global_profile) return;
+    int fi = profile_current_file;
+    if (!global_profile->loaded[fi]) return;
+    ProfileFile *pf = &global_profile->files[fi];
+    if (!pf->has_z) return;
+    profile_current_time_idx += dir;
+    if (profile_current_time_idx < 0) profile_current_time_idx = pf->ntimes - 1;
+    if (profile_current_time_idx >= pf->ntimes) profile_current_time_idx = 0;
+    update_profile_info_label(global_profile);
+    render_profile_canvas(global_profile);
+}
+
+void profile_logx_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    (void)w; (void)client_data; (void)call_data;
+    profile_log_x = !profile_log_x;
+    render_profile_canvas(global_profile);
+}
+
+void profile_contour_callback(Widget w, XtPointer client_data, XtPointer call_data) {
+    (void)w; (void)client_data; (void)call_data;
+    profile_contour_mode = !profile_contour_mode;
+    update_profile_info_label(global_profile);
+    render_profile_canvas(global_profile);
+}
+
+void init_profile_gui(ProfileData *pd, int argc, char **argv) {
+    Arg args[20];
+    int n;
+
+    global_profile = pd;
+
+    toplevel = XtAppInitialize(NULL, "PLTView-Profile", NULL, 0, &argc, argv, NULL, NULL, 0);
+    display = XtDisplay(toplevel);
+    screen  = DefaultScreen(display);
+
+    font = XLoadQueryFont(display, "fixed");
+    if (!font) font = XLoadQueryFont(display, "*");
+
+    /* Compute var viewport width from longest column name */
+    int vp_width = 120;
+    if (font) {
+        int fi = profile_current_file;
+        if (pd->loaded[fi]) {
+            ProfileFile *pf = &pd->files[fi];
+            for (int i = 0; i < pf->ncols; i++) {
+                int tw = XTextWidth(font, pf->col_names[i], strlen(pf->col_names[i])) + 24;
+                if (tw > vp_width) vp_width = tw;
+            }
+        }
+        /* also check all files for widest name */
+        for (int fi2 = 0; fi2 < N_PROFILE_FILES; fi2++) {
+            if (!pd->loaded[fi2]) continue;
+            ProfileFile *pf = &pd->files[fi2];
+            for (int i = 0; i < pf->ncols; i++) {
+                int tw = XTextWidth(font, pf->col_names[i], strlen(pf->col_names[i])) + 24;
+                if (tw > vp_width) vp_width = tw;
+            }
+        }
+        if (vp_width > 160) vp_width = 160;
+    }
+    int canvas_w = 820, canvas_h = 520;
+
+    /* Main form */
+    n = 0;
+    XtSetArg(args[n], XtNwidth,  canvas_w + vp_width + 20); n++;
+    XtSetArg(args[n], XtNheight, canvas_h + 100); n++;
+    form = XtCreateManagedWidget("form", formWidgetClass, toplevel, args, n);
+
+    /* Info label at top spanning full width */
+    n = 0;
+    XtSetArg(args[n], XtNlabel, "1D Profiles - Loading..."); n++;
+    XtSetArg(args[n], XtNwidth, canvas_w + vp_width); n++;
+    XtSetArg(args[n], XtNborderWidth, 1); n++;
+    XtSetArg(args[n], XtNtop,   XawChainTop);  n++;
+    XtSetArg(args[n], XtNleft,  XawChainLeft); n++;
+    XtSetArg(args[n], XtNright, XawChainRight); n++;
+    profile_info_label = XtCreateManagedWidget("info", labelWidgetClass, form, args, n);
+
+    /* Variable viewport: left column, below info label */
+    n = 0;
+    XtSetArg(args[n], XtNfromVert,    profile_info_label); n++;
+    XtSetArg(args[n], XtNwidth,       vp_width); n++;
+    XtSetArg(args[n], XtNheight,      canvas_h); n++;
+    XtSetArg(args[n], XtNallowVert,   True); n++;
+    XtSetArg(args[n], XtNallowHoriz,  False); n++;
+    XtSetArg(args[n], XtNforceBars,   True); n++;
+    XtSetArg(args[n], XtNtop,         XawChainTop); n++;
+    XtSetArg(args[n], XtNbottom,      XawChainBottom); n++;
+    XtSetArg(args[n], XtNleft,        XawChainLeft); n++;
+    profile_var_viewport = XtCreateManagedWidget("varViewport", viewportWidgetClass, form, args, n);
+
+    /* Canvas: to the right of var viewport */
+    n = 0;
+    XtSetArg(args[n], XtNfromVert,    profile_info_label); n++;
+    XtSetArg(args[n], XtNfromHoriz,   profile_var_viewport); n++;
+    XtSetArg(args[n], XtNwidth,       canvas_w); n++;
+    XtSetArg(args[n], XtNheight,      canvas_h); n++;
+    XtSetArg(args[n], XtNborderWidth, 2); n++;
+    XtSetArg(args[n], XtNtop,         XawChainTop); n++;
+    XtSetArg(args[n], XtNbottom,      XawChainBottom); n++;
+    XtSetArg(args[n], XtNleft,        XawChainLeft); n++;
+    XtSetArg(args[n], XtNright,       XawChainRight); n++;
+    profile_canvas_widget = XtCreateManagedWidget("profileCanvas", simpleWidgetClass, form, args, n);
+
+    /* Controls row below both: file buttons + nav + options */
+    Widget ctrl_box;
+    n = 0;
+    XtSetArg(args[n], XtNfromVert,    profile_canvas_widget); n++;
+    XtSetArg(args[n], XtNorientation, XtorientHorizontal); n++;
+    XtSetArg(args[n], XtNborderWidth, 1); n++;
+    XtSetArg(args[n], XtNbottom,      XawChainBottom); n++;
+    XtSetArg(args[n], XtNleft,        XawChainLeft); n++;
+    XtSetArg(args[n], XtNright,       XawChainRight); n++;
+    ctrl_box = XtCreateManagedWidget("ctrlBox", boxWidgetClass, form, args, n);
+
+    /* File label + buttons */
+    n=0; XtSetArg(args[n], XtNlabel, "File:"); n++; XtSetArg(args[n], XtNborderWidth, 0); n++;
+    XtCreateManagedWidget("fileLabel", labelWidgetClass, ctrl_box, args, n);
+    for (int i = 0; i < N_PROFILE_FILES; i++) {
+        n = 0;
+        XtSetArg(args[n], XtNlabel, profile_file_labels[i]); n++;
+        if (!pd->loaded[i]) { XtSetArg(args[n], XtNsensitive, False); n++; }
+        profile_file_buttons[i] = XtCreateManagedWidget(profile_file_labels[i],
+            commandWidgetClass, ctrl_box, args, n);
+        XtAddCallback(profile_file_buttons[i], XtNcallback, profile_file_callback, (XtPointer)(long)i);
+    }
+
+    /* Separator label */
+    n=0; XtSetArg(args[n], XtNlabel, " | "); n++; XtSetArg(args[n], XtNborderWidth, 0); n++;
+    XtCreateManagedWidget("sep1", labelWidgetClass, ctrl_box, args, n);
+
+    /* Timestep nav */
+    n=0; XtSetArg(args[n], XtNlabel, "t:"); n++; XtSetArg(args[n], XtNborderWidth, 0); n++;
+    XtCreateManagedWidget("tLabel", labelWidgetClass, ctrl_box, args, n);
+    n=0; XtSetArg(args[n], XtNlabel, "<"); n++;
+    Widget pb = XtCreateManagedWidget("prev", commandWidgetClass, ctrl_box, args, n);
+    XtAddCallback(pb, XtNcallback, profile_time_nav_callback, (XtPointer)-1L);
+    n=0; XtSetArg(args[n], XtNlabel, ">"); n++;
+    Widget nb = XtCreateManagedWidget("next", commandWidgetClass, ctrl_box, args, n);
+    XtAddCallback(nb, XtNcallback, profile_time_nav_callback, (XtPointer)1L);
+
+    /* Separator */
+    n=0; XtSetArg(args[n], XtNlabel, " | "); n++; XtSetArg(args[n], XtNborderWidth, 0); n++;
+    XtCreateManagedWidget("sep2", labelWidgetClass, ctrl_box, args, n);
+
+    /* LogX */
+    n=0; XtSetArg(args[n], XtNlabel, "LogX"); n++;
+    Widget lx = XtCreateManagedWidget("logX", commandWidgetClass, ctrl_box, args, n);
+    XtAddCallback(lx, XtNcallback, profile_logx_callback, NULL);
+
+    /* Contour toggle */
+    n=0; XtSetArg(args[n], XtNlabel, "Contour"); n++;
+    Widget ct = XtCreateManagedWidget("contour", commandWidgetClass, ctrl_box, args, n);
+    XtAddCallback(ct, XtNcallback, profile_contour_callback, NULL);
+
+    /* Realize */
+    XtRealizeWidget(toplevel);
+
+    profile_canvas = XtWindow(profile_canvas_widget);
+    XtAddEventHandler(profile_canvas_widget, ExposureMask, False,
+                      profile_canvas_expose_callback, NULL);
+    XSelectInput(display, profile_canvas, ExposureMask | KeyPressMask);
+
+    /* Build initial var buttons inside viewport */
+    profile_rebuild_var_buttons(pd);
+}
+
 int main(int argc, char **argv) {
     PlotfileData pf = {0};
     Arg args[2];
@@ -10245,29 +11349,25 @@ int main(int argc, char **argv) {
 
     init_map_layers_dir(argv[0]);
 
-    /* Check for --sdm and --sbm flags */
+    /* Check for --sdm, --sbm, --profile flags */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--sdm") == 0) {
             sdm_mode = 1;
-            /* Shift remaining args over this flag */
-            for (int j = i; j < argc - 1; j++) {
-                argv[j] = argv[j + 1];
-            }
-            argc--;
-            i--;  /* Re-check this position */
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
         } else if (strcmp(argv[i], "--sbm") == 0) {
             sbm_mode = 1;
-            /* Shift remaining args over this flag */
-            for (int j = i; j < argc - 1; j++) {
-                argv[j] = argv[j + 1];
-            }
-            argc--;
-            i--;  /* Re-check this position */
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        } else if (strcmp(argv[i], "--profile") == 0) {
+            profile_mode = 1;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
         }
     }
 
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s [--sdm|--sbm] <plotfile_directory> [prefix]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--sdm|--sbm|--profile] <directory> [prefix]\n", argv[0]);
         fprintf(stderr, "  Single plotfile:    %s plt00100\n", argv[0]);
         fprintf(stderr, "  Multi-timestep:     %s /path/to/dir plt\n", argv[0]);
         fprintf(stderr, "  With prefix plt2d:  %s /path/to/dir plt2d\n", argv[0]);
@@ -10275,6 +11375,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  SDM multi-timestep: %s --sdm /path/to/dir plt\n", argv[0]);
         fprintf(stderr, "  SBM mode:           %s --sbm plt00100\n", argv[0]);
         fprintf(stderr, "  SBM multi-timestep: %s --sbm /path/to/dir plt\n", argv[0]);
+        fprintf(stderr, "  1D Profiles:        %s --profile /path/to/dir\n", argv[0]);
         return 1;
     }
 
@@ -10406,7 +11507,7 @@ int main(int argc, char **argv) {
             current_timestep = 0;
             printf("SBM multi-timestep mode: %d timesteps found\n", n_timesteps);
         }
-    } else {
+    } else if (!profile_mode) {
         snprintf(check_path, MAX_PATH, "%s/Header", argv[1]);
         FILE *fp = fopen(check_path, "r");
 
@@ -10626,6 +11727,158 @@ int main(int argc, char **argv) {
             if (sbm_hist_data->bin_edges) free(sbm_hist_data->bin_edges);
             free(sbm_hist_data);
         }
+        return 0;
+    }
+
+    /* 1D Profile mode */
+    if (profile_mode) {
+        ProfileData *pd = (ProfileData *)calloc(1, sizeof(ProfileData));
+        if (!pd) { fprintf(stderr, "Error: out of memory\n"); return 1; }
+        strncpy(pd->dir, argv[1], MAX_PATH - 1);
+
+        /* Try to load each profile file: exact match first, then substring match */
+        const char *keywords[N_PROFILE_FILES] = {"surf", "mean", "flux", "subgrid"};
+        char matched_paths[N_PROFILE_FILES][MAX_PATH];
+        int any_loaded = 0;
+        memset(matched_paths, 0, sizeof(matched_paths));
+
+        for (int fi = 0; fi < N_PROFILE_FILES; fi++) {
+            char exact[MAX_PATH];
+            snprintf(exact, sizeof(exact), "%s/%s", pd->dir, keywords[fi]);
+            if (read_profile_file(&pd->files[fi], exact, fi) == 0) {
+                pd->loaded[fi] = 1;
+                any_loaded = 1;
+                strncpy(matched_paths[fi], exact, MAX_PATH - 1);
+                continue;
+            }
+            /* Substring scan of directory entries */
+            DIR *dp = opendir(pd->dir);
+            if (dp) {
+                struct dirent *de;
+                while ((de = readdir(dp)) != NULL) {
+                    if (strstr(de->d_name, keywords[fi])) {
+                        char candidate[MAX_PATH];
+                        snprintf(candidate, sizeof(candidate), "%s/%s", pd->dir, de->d_name);
+                        if (read_profile_file(&pd->files[fi], candidate, fi) == 0) {
+                            pd->loaded[fi] = 1;
+                            any_loaded = 1;
+                            strncpy(matched_paths[fi], candidate, MAX_PATH - 1);
+                            printf("Profile: matched '%s' -> %s\n", keywords[fi], de->d_name);
+                            break;
+                        }
+                    }
+                }
+                closedir(dp);
+            }
+        }
+
+        if (!any_loaded) {
+            /* Show X11 error popup before exiting */
+            Display *err_dpy = XOpenDisplay(NULL);
+            if (err_dpy) {
+                Widget err_top = XtAppInitialize(NULL, "PLTViewErr", NULL, 0,
+                                                  &argc, argv, NULL, NULL, 0);
+                Display *ed = XtDisplay(err_top);
+                int es = DefaultScreen(ed);
+                XFontStruct *ef = XLoadQueryFont(ed, "fixed");
+
+                Widget err_form = XtCreateManagedWidget("form", formWidgetClass, err_top, NULL, 0);
+
+                Arg ea[8]; int en;
+                char errmsg[512];
+                snprintf(errmsg, sizeof(errmsg),
+                    "No profile files found in:\n%s\n\n"
+                    "Expected files containing: surf, mean, flux, subgrid\n"
+                    "(e.g. abl_surf, abl_mean, ...)\n\n"
+                    "Please rename or use erf.data_log to set names.", argv[1]);
+
+                en = 0;
+                XtSetArg(ea[en], XtNlabel, errmsg); en++;
+                XtSetArg(ea[en], XtNwidth, 420); en++;
+                XtSetArg(ea[en], XtNborderWidth, 0); en++;
+                Widget emsg = XtCreateManagedWidget("msg", labelWidgetClass, err_form, ea, en);
+
+                en = 0;
+                XtSetArg(ea[en], XtNfromVert, emsg); en++;
+                XtSetArg(ea[en], XtNlabel, "OK"); en++;
+                Widget eok = XtCreateManagedWidget("ok", commandWidgetClass, err_form, ea, en);
+                (void)eok;
+
+                XtRealizeWidget(err_top);
+                /* Simple event loop: close on OK click or any key */
+                XtAppContext ectx = XtWidgetToApplicationContext(err_top);
+                XEvent ev;
+                int done = 0;
+                while (!done) {
+                    XtAppNextEvent(ectx, &ev);
+                    if (ev.type == ButtonPress) done = 1;
+                    else XtDispatchEvent(&ev);
+                }
+                (void)ef; (void)es;
+                XtDestroyWidget(err_top);
+                XCloseDisplay(err_dpy);
+            }
+            fprintf(stderr, "Error: No profile files (surf/mean/flux/subgrid) found in %s\n", argv[1]);
+            free(pd); return 1;
+        }
+
+        /* Set initial file to first loaded profile file (prefer mean) */
+        profile_current_file = PROFILE_FILE_MEAN;
+        if (!pd->loaded[profile_current_file]) {
+            for (int fi = 0; fi < N_PROFILE_FILES; fi++) {
+                if (pd->loaded[fi]) { profile_current_file = fi; break; }
+            }
+        }
+        ProfileFile *init_pf = &pd->files[profile_current_file];
+        profile_current_col = init_pf->has_z ? 2 : 1;
+        if (profile_current_col >= init_pf->ncols) profile_current_col = 0;
+
+        init_profile_gui(pd, argc, argv);
+        update_profile_info_label(pd);
+        render_profile_canvas(pd);
+
+        printf("\n1D Profile Controls:\n");
+        printf("  Click [surf/mean/flux/subgrid] to switch file\n");
+        printf("  Click variable name button to select column\n");
+        printf("  Click </> to step through timesteps\n");
+        printf("  Click LogX to toggle log x-axis\n\n");
+
+        XtAppContext app_context = XtWidgetToApplicationContext(toplevel);
+        while (1) {
+            XEvent event;
+            XtAppNextEvent(app_context, &event);
+            if (event.type == Expose) {
+                if (event.xexpose.window == profile_canvas) {
+                    render_profile_canvas(pd);
+                    if (!initial_focus_set) {
+                        XSetInputFocus(display, profile_canvas, RevertToParent, CurrentTime);
+                        initial_focus_set = 1;
+                    }
+                }
+            } else if (event.type == KeyPress &&
+                       event.xkey.window == profile_canvas) {
+                KeySym key = XLookupKeysym(&event.xkey, 0);
+                ProfileFile *cpf = &pd->files[profile_current_file];
+                if ((key == XK_Right || key == XK_n) && pd->loaded[profile_current_file] && cpf->has_z) {
+                    profile_current_time_idx++;
+                    if (profile_current_time_idx >= cpf->ntimes) profile_current_time_idx = 0;
+                    update_profile_info_label(pd);
+                    render_profile_canvas(pd);
+                    continue;
+                } else if ((key == XK_Left || key == XK_p) && pd->loaded[profile_current_file] && cpf->has_z) {
+                    profile_current_time_idx--;
+                    if (profile_current_time_idx < 0) profile_current_time_idx = cpf->ntimes - 1;
+                    update_profile_info_label(pd);
+                    render_profile_canvas(pd);
+                    continue;
+                }
+            }
+            XtDispatchEvent(&event);
+        }
+
+        for (int fi = 0; fi < N_PROFILE_FILES; fi++)
+            free_profile_file(&pd->files[fi]);
+        free(pd);
         return 0;
     }
 
